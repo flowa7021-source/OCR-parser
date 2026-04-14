@@ -3,9 +3,10 @@
 
 Десктопное приложение для Windows 10/11 на Python + Tkinter. Извлекает данные
 российских транспортных накладных (ТН) из машиночитаемых PDF и сохраняет
-результат в форматированный .xlsx.
+результат в форматированный .xlsx + лог-файл с уровнями доверия.
 
-Логика парсинга вынесена в пакет `tn_parser/`; этот модуль — тонкий GUI-слой.
+Логика парсинга, записи Excel и формирования лога вынесена в пакет
+`tn_parser/`. Этот модуль — тонкий GUI-слой поверх него.
 """
 
 from __future__ import annotations
@@ -17,17 +18,18 @@ import threading
 import time
 import tkinter as tk
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Dict, List, Optional
+from typing import List, Optional
 
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
-
-from tn_parser import ParsedRow, extract_raw_text, process_one_pdf
-from tn_parser.models import GARBAGE, MISSING
+from tn_parser import (
+    ParsedRow,
+    build_log_lines,
+    extract_raw_text,
+    process_batch,
+    write_excel,
+    write_log,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -36,71 +38,7 @@ from tn_parser.models import GARBAGE, MISSING
 
 APP_TITLE = "Парсер транспортных накладных"
 OUTPUT_FILENAME = "extraction.xlsx"
-SHEET_NAME = "Extraction"
-
-COLUMNS = [
-    ("Транспортная накладная", 30),
-    ("Дата", 14),
-    ("№", 15),
-    ("Грузоотправитель", 35),
-    ("Грузополучатель", 35),
-    ("Груз", 35),
-    ("Перевозчик", 35),
-    ("Транспортное средство", 22),
-    ("Прием груза", 40),
-    ("Источник файл", 25),
-    ("Примечание", 18),
-]
-
-
-# ---------------------------------------------------------------------------
-# Запись Excel
-# ---------------------------------------------------------------------------
-
-
-def write_excel(rows: List[ParsedRow], output_path: str) -> None:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = SHEET_NAME
-
-    thin = Side(style="thin", color="000000")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="4472C4")
-    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    body_font = Font(name="Arial", size=10)
-    body_align = Alignment(horizontal="left", vertical="top", wrap_text=True)
-
-    headers = [c[0] for c in COLUMNS]
-    ws.append(headers)
-    for col_idx, _ in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_align
-        cell.border = border
-
-    for row in rows:
-        ws.append(row.to_excel_tuple())
-
-    last_row = ws.max_row
-    last_col = len(COLUMNS)
-    for r in range(2, last_row + 1):
-        for c in range(1, last_col + 1):
-            cell = ws.cell(row=r, column=c)
-            cell.font = body_font
-            cell.alignment = body_align
-            cell.border = border
-
-    for idx, (_, width) in enumerate(COLUMNS, start=1):
-        ws.column_dimensions[get_column_letter(idx)].width = width
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(last_col)}{max(last_row, 1)}"
-
-    wb.save(output_path)
+LOG_FILENAME = "extraction.log"
 
 
 # ---------------------------------------------------------------------------
@@ -119,9 +57,6 @@ class ParserApp:
         self.output_var = tk.StringVar()
         self.worker_thread: Optional[threading.Thread] = None
         self.msg_queue: "queue.Queue[tuple]" = queue.Queue()
-
-        # Для кнопки «Сырой текст»: последний список обработанных PDF.
-        self._last_pdfs: List[str] = []
 
         self._build_ui()
         self._poll_queue()
@@ -197,11 +132,6 @@ class ParserApp:
     # ---- «Сырой текст» -----------------------------------------------------
 
     def _on_show_raw(self) -> None:
-        """Показывает сырой текст выбранного PDF в отдельном окне.
-
-        Удобно отлаживать парсинг: видно, что вытащил PyMuPDF, и почему
-        регулярка могла не сработать.
-        """
         initial = self.input_var.get().strip() or os.getcwd()
         pdf_path = filedialog.askopenfilename(
             title="Выберите PDF для просмотра",
@@ -239,7 +169,7 @@ class ParserApp:
         ttk.Button(bottom, text="Копировать всё", command=copy_all).pack(side="right")
         ttk.Button(bottom, text="Закрыть", command=win.destroy).pack(side="right", padx=6)
 
-    # ---- Логирование -------------------------------------------------------
+    # ---- Логирование в UI --------------------------------------------------
 
     def _log(self, line: str) -> None:
         self.log.configure(state="normal")
@@ -295,7 +225,6 @@ class ParserApp:
             messagebox.showwarning(APP_TITLE, "В выбранной папке нет PDF-файлов.")
             return
 
-        self._last_pdfs = pdfs
         self.run_btn.configure(state="disabled")
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
@@ -304,60 +233,68 @@ class ParserApp:
         self.progress_label.configure(text=f"0/{len(pdfs)}")
 
         out_path = os.path.join(out_dir, OUTPUT_FILENAME)
+        log_path = os.path.join(out_dir, LOG_FILENAME)
         self.worker_thread = threading.Thread(
-            target=self._worker, args=(pdfs, out_path), daemon=True
+            target=self._worker,
+            args=(pdfs, in_dir, out_path, log_path),
+            daemon=True,
         )
         self.worker_thread.start()
 
-    def _worker(self, pdfs: List[str], out_path: str) -> None:
+    def _worker(
+        self,
+        pdfs: List[str],
+        input_dir: str,
+        out_path: str,
+        log_path: str,
+    ) -> None:
         t0 = time.time()
         total = len(pdfs)
-        ok_count = 0
-        err_count = 0
-        results: Dict[str, List[ParsedRow]] = {}
 
-        # Параллельная обработка: PyMuPDF освобождает GIL во время чтения PDF.
-        max_workers = min(8, max(2, (os.cpu_count() or 2)))
+        def _on_progress(done, total_, pdf_path, rows) -> None:
+            fname = os.path.basename(pdf_path)
+            if rows and rows[0].note.startswith("ERROR:"):
+                self.msg_queue.put(("log", f"Ошибка: {fname} — {rows[0].note[7:]}"))
+            else:
+                avg_pct = round(
+                    sum(r.confidence.overall() for r in rows) / max(len(rows), 1) * 100
+                )
+                extra = f" ({len(rows)} накладных)" if len(rows) > 1 else ""
+                self.msg_queue.put(("log", f"Обработано: {fname} — {avg_pct}%{extra}"))
+            self.msg_queue.put(("progress", done, total_))
+
         try:
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                future_to_path = {pool.submit(process_one_pdf, p): p for p in pdfs}
-                done = 0
-                for fut in as_completed(future_to_path):
-                    pdf_path = future_to_path[fut]
-                    fname = os.path.basename(pdf_path)
-                    try:
-                        rows = fut.result()
-                    except Exception as exc:  # noqa: BLE001
-                        rows = [ParsedRow.empty_missing(fname, note=f"ERROR: {exc}")]
-                    results[pdf_path] = rows
+            results = process_batch(pdfs, progress=_on_progress)
 
-                    any_error = any(r.note.startswith("ERROR:") for r in rows)
-                    if any_error:
-                        err_count += 1
-                        err_text = next(r.note for r in rows if r.note.startswith("ERROR:"))
-                        self.msg_queue.put(("log", f"Ошибка: {fname} — {err_text[7:]}"))
-                    else:
-                        ok_count += 1
-                        suffix = f" ({len(rows)} накладных)" if len(rows) > 1 else ""
-                        self.msg_queue.put(("log", f"Обработано: {fname} — OK{suffix}"))
-
-                    done += 1
-                    self.msg_queue.put(("progress", done, total))
-
-            # Сохраняем строки в исходном порядке.
             ordered_rows: List[ParsedRow] = []
             for p in pdfs:
                 ordered_rows.extend(results.get(p, []))
             write_excel(ordered_rows, out_path)
 
             elapsed = time.time() - t0
+            rows_by_fname = {os.path.basename(p): results[p] for p in pdfs if p in results}
+            log_lines = build_log_lines(
+                input_path=input_dir,
+                output_path=out_path,
+                elapsed_s=elapsed,
+                rows_by_file=rows_by_fname,
+            )
+            write_log(log_path, log_lines)
+
+            ok_count = sum(
+                1 for rows in results.values()
+                if not any(r.note.startswith("ERROR:") for r in rows)
+            )
+            err_count = len(results) - ok_count
+
             self.msg_queue.put(("log", "──────────────────────────"))
             self.msg_queue.put((
                 "log",
                 f"Итого: {total} файлов, {ok_count} OK, {err_count} ошибок, "
                 f"{len(ordered_rows)} строк (за {elapsed:.1f} с)",
             ))
-            self.msg_queue.put(("log", f"Сохранено: {out_path}"))
+            self.msg_queue.put(("log", f"Excel: {out_path}"))
+            self.msg_queue.put(("log", f"Лог:   {log_path}"))
         except Exception as exc:  # noqa: BLE001
             tb = traceback.format_exc(limit=4)
             self.msg_queue.put(("log", f"Критическая ошибка: {exc}\n{tb}"))

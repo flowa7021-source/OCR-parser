@@ -164,3 +164,64 @@ def process_one_pdf(pdf_path: str, use_cache: bool = True) -> List[ParsedRow]:
     if use_cache:
         _cache_put(pdf_path, rows)
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Пакетная обработка (общая для GUI и CLI)
+# ---------------------------------------------------------------------------
+
+
+def iter_pdfs(input_path: str) -> List[str]:
+    """Принимает папку или один PDF, возвращает отсортированный список путей."""
+    if os.path.isfile(input_path):
+        return [input_path] if input_path.lower().endswith(".pdf") else []
+    if os.path.isdir(input_path):
+        return sorted(
+            os.path.join(input_path, f)
+            for f in os.listdir(input_path)
+            if f.lower().endswith(".pdf")
+            and os.path.isfile(os.path.join(input_path, f))
+        )
+    return []
+
+
+def process_batch(
+    pdfs: List[str],
+    use_cache: bool = True,
+    max_workers: Optional[int] = None,
+    progress=None,
+) -> "dict[str, List[ParsedRow]]":
+    """Пакетная обработка: возвращает dict {pdf_path: [ParsedRow, ...]}.
+
+    `progress` — опциональный callable(done, total) для обновления UI.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if max_workers is None:
+        max_workers = min(8, max(2, (os.cpu_count() or 2)))
+
+    results: "dict[str, List[ParsedRow]]" = {}
+    total = len(pdfs)
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        fut_to_path = {
+            pool.submit(process_one_pdf, p, use_cache): p for p in pdfs
+        }
+        for fut in as_completed(fut_to_path):
+            p = fut_to_path[fut]
+            try:
+                results[p] = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                results[p] = [
+                    ParsedRow.empty_missing(os.path.basename(p), note=f"ERROR: {exc}")
+                ]
+            done += 1
+            if progress is not None:
+                try:
+                    progress(done, total, p, results[p])
+                except Exception:  # noqa: BLE001
+                    pass
+
+    # Сохраняем исходный порядок.
+    return {p: results[p] for p in pdfs if p in results}

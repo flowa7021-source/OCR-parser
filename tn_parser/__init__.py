@@ -16,7 +16,15 @@
 """
 
 from .models import MISSING, GARBAGE, ParsedRow, FieldConfidence
-from .core import process_one_pdf, parse_text, extract_raw_text
+from .core import (
+    extract_raw_text,
+    iter_pdfs,
+    parse_text,
+    process_batch,
+    process_one_pdf,
+)
+from .excel import COLUMNS, write_excel
+from .report import build_log_lines, write_log
 
 __all__ = [
     "MISSING",
@@ -26,4 +34,10 @@ __all__ = [
     "process_one_pdf",
     "parse_text",
     "extract_raw_text",
+    "iter_pdfs",
+    "process_batch",
+    "COLUMNS",
+    "write_excel",
+    "build_log_lines",
+    "write_log",
 ]
