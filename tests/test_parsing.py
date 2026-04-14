@@ -40,7 +40,9 @@ class TestStandardWaybill:
         assert "Быстрые Перевозки" in self.row.carrier
 
     def test_vehicle_has_valid_grz(self):
-        assert "А123ВС777" in self.row.vehicle
+        # Канонический вид: "А 123 ВС 777".
+        assert "А 123 ВС 777" in self.row.vehicle
+        assert "А123ВС777" in self.row.vehicle.replace(" ", "")
 
     def test_reception(self):
         assert "15.03.2024" in self.row.reception
@@ -87,9 +89,13 @@ class TestRealSample7145B:
         assert "Самовывоз" in self.row.carrier
 
     def test_vehicle_has_grz_with_spaces(self):
-        # ГРЗ в документе: "Р 814 НР 152" (пробелы между частями).
-        v = self.row.vehicle.replace(" ", "")
-        assert "Р814НР152" in v
+        # Канонический вид ГРЗ: "Р 814 НР 152".
+        assert "Р 814 НР 152" in self.row.vehicle
+
+    def test_cargo_keeps_latin_in_mixed_word(self):
+        # «Тенsar» — латинская «a» должна остаться латинской.
+        assert "sar" in self.row.cargo  # латинский кластер сохранён
+        assert "\u0441\u0430r" not in self.row.cargo  # не кириллическая «с а»
 
     def test_reception_stops_at_next_section(self):
         r = self.row.reception

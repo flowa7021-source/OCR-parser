@@ -14,18 +14,12 @@ from typing import Dict, Optional, Tuple
 from .normalize import clean_value, is_garbage
 from .validators import (
     find_grz,
+    format_grz,
     is_valid_date,
     is_valid_grz,
 )
 from .models import MISSING, GARBAGE
 
-
-# Регулярки для организационно-правовой формы — это хорошие маркеры конца
-# названия контрагента при «одной строкой».
-_ORG_TERMINATORS = (
-    r"\b(?:ИНН|КПП|ОГРН|ОКПО|адрес|тел\.?|телефон|e-?mail|\+7|т\.|факс)\b"
-)
-_ORG_TERMINATOR_RE = re.compile(_ORG_TERMINATORS, re.IGNORECASE)
 
 _DATE_ANY = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
 _NUMBER_IN_HEADER = re.compile(
@@ -51,35 +45,6 @@ _SERVICE_LINE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-
-
-def _truncate_at_terminator(s: str, max_len: int = 250) -> str:
-    """Обрезает строку у первого терминатора (ИНН, КПП, телефон и т. п.).
-
-    ВАЖНО: для ТН мы, наоборот, хотим оставить реквизиты (ИНН/КПП/адрес)
-    в значении поля «Грузоотправитель»/«Грузополучатель», потому что именно
-    они однозначно идентифицируют контрагента. Поэтому по умолчанию функция
-    возвращает строку БЕЗ обрезки и используется только там, где хвост —
-    шум следующего раздела.
-    """
-    if not s:
-        return s
-    return s[:max_len].strip()
-
-
-def _trim_organization(s: str, max_len: int = 400) -> str:
-    """Чуть более агрессивная обрезка — для одиночной строки 'после двоеточия',
-    где дальше идёт мусор."""
-    if not s:
-        return s
-    s = s.strip()
-    m = _ORG_TERMINATOR_RE.search(s)
-    # Оставляем ИНН/КПП — это часть ценных реквизитов. Обрезаем только телефон
-    # и явные «мусорные» маркеры.
-    return s[:max_len].strip()
-
-
-# ---------------------------------------------------------------------------
 
 
 def extract_number_and_date(
@@ -227,6 +192,7 @@ def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
         compact = re.sub(r"(?<=[А-Я0-9])\s+(?=[А-Я0-9])", "", candidate_text)
         grz = find_grz(compact)
         if grz and is_valid_grz(grz):
+            pretty = format_grz(grz)
             # Дополнительная марка/модель, если рядом.
             extra = []
             for line in section_body.splitlines():
@@ -241,8 +207,8 @@ def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
                         if len(extra) >= 2:
                             break
             if extra:
-                return f"{grz} ({'; '.join(extra)})", 1.0
-            return grz, 1.0
+                return f"{pretty} ({'; '.join(extra)})", 1.0
+            return pretty, 1.0
 
         # ГРЗ не нашли — берём первую содержательную непустую строку.
         lines = [ln.strip() for ln in section_body.splitlines() if ln.strip()]
@@ -256,7 +222,7 @@ def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
         compact_full = re.sub(r"(?<=[А-ЯA-Z0-9])\s+(?=[А-ЯA-Z0-9])", "", full_text.upper())
         grz = find_grz(compact_full)
         if grz and is_valid_grz(grz):
-            return grz, 0.7
+            return format_grz(grz), 0.7
 
         for pat in (
             r"гос\.?\s*номер\s*[:\-–—]?\s*([^\n\r]{2,40})",

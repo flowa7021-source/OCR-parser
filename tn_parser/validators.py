@@ -64,6 +64,28 @@ def find_grz(text: str) -> Optional[str]:
     return m.group(0).strip() if m else None
 
 
+_GRZ_MAIN_PARTS = re.compile(
+    rf"^([{_GRZ_LETTERS}])(\d{{3}})([{_GRZ_LETTERS}]{{2}})\s?(\d{{2,3}})$"
+)
+_GRZ_TRAILER_PARTS = re.compile(
+    rf"^([{_GRZ_LETTERS}]{{2}})(\d{{4}})\s?(\d{{2,3}})$"
+)
+
+
+def format_grz(grz: str) -> str:
+    """Канонический вид ГРЗ с пробелами: «Р 814 НР 152»."""
+    if not grz:
+        return grz
+    s = grz.upper().replace(" ", "")
+    m = _GRZ_MAIN_PARTS.match(s)
+    if m:
+        return f"{m.group(1)} {m.group(2)} {m.group(3)} {m.group(4)}"
+    m = _GRZ_TRAILER_PARTS.match(s)
+    if m:
+        return f"{m.group(1)} {m.group(2)} {m.group(3)}"
+    return grz
+
+
 # --- ИНН -------------------------------------------------------------------
 
 

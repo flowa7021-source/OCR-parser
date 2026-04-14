@@ -60,20 +60,31 @@ def _strip_invisible(text: str) -> str:
     return text
 
 
-def _fix_confusables(text: str) -> str:
-    """Если в слове есть хотя бы одна кириллица — меняем латинских «визуальных
-    двойников» внутри того же слова на кириллицу.
+def _is_cyr(c: str) -> bool:
+    return bool(c) and ("\u0400" <= c <= "\u04FF")
 
-    Это спасает от OCR-артефактов ("ИНН" → "ИHH"), не ломая корректные
-    латинские слова (ООО "Rolf" остаётся "Rolf").
+
+def _fix_confusables(text: str) -> str:
+    """Меняем латинские буквы-двойники на кириллицу, но только когда
+    соседние буквы в слове — кириллические.
+
+    Это чинит OCR-артефакты вроде «ИHH» → «ИНН» и «Мapкa» → «Марка», но не
+    трогает смешанные product-names типа «Тенsar», где латинский «a»
+    окружён латинскими соседями (s, r).
+
+    Идём слева направо, опираясь на уже сконвертированные предыдущие символы
+    (чтобы второй H в «ИHH» увидел, что его левый сосед теперь Н).
     """
 
     def replace(m: re.Match[str]) -> str:
-        w = m.group(0)
-        has_cyr = any("А" <= c <= "я" or c in "Ёё" for c in w)
-        if not has_cyr:
-            return w
-        return "".join(_LAT_TO_CYR.get(c, c) for c in w)
+        chars = list(m.group(0))
+        for i, c in enumerate(chars):
+            if c in _LAT_TO_CYR:
+                left = chars[i - 1] if i > 0 else ""
+                right = chars[i + 1] if i + 1 < len(chars) else ""
+                if _is_cyr(left) or _is_cyr(right):
+                    chars[i] = _LAT_TO_CYR[c]
+        return "".join(chars)
 
     return _MIXED_WORD.sub(replace, text)
 

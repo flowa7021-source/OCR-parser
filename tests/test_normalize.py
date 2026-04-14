@@ -38,6 +38,14 @@ def test_latin_only_words_preserved():
     assert "Volvo" in normalize_for_sections("Volvo FH")
 
 
+def test_mixed_script_product_name_preserved():
+    # В «Тенsar» латинский кластер «sar» окружён только латиницей — не трогаем.
+    result = normalize_for_sections("Тенsar")
+    # Латинская «a» (U+0061) сохранена, а не заменена на кириллическую «а».
+    assert "a" in result  # ASCII 'a' (U+0061)
+    assert "\u0430" not in result  # cyrillic 'а'
+
+
 def test_collapse_joins_lines():
     assert collapse("a\nb\nc") == "a b c"
 
