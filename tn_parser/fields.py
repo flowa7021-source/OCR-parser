@@ -1,15 +1,24 @@
 # -*- coding: utf-8 -*-
 """Извлечение конкретных полей из разделов ТН.
 
-Принцип: сначала ищем поле в «своём» разделе (высокая уверенность), если его
+Принцип: сначала ищем поле в «своём» разделе (высокая уверенность), если
 нет — падаем на эвристики по всему тексту (низкая уверенность). Каждый
 экстрактор возвращает кортеж (value, confidence).
+
+Сложности реального OCR:
+- В таблице заголовок ячейки и её значение — на разных «логических» строках.
+- Ячейки с двумя колонками (способ | ФИО, марка | ГРЗ) после извлечения
+  разворачиваются в две соседние строки.
+- Пояснения в скобках («(реквизиты, позволяющие идентифицировать…)») и
+  формульные подсказки (« является экспедитором», « (а) … ») — мусор.
+
+Экстракторы ниже стараются это учесть.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .normalize import clean_value, is_garbage
 from .validators import (
@@ -22,66 +31,124 @@ from .models import MISSING, GARBAGE
 
 
 _DATE_ANY = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
-_NUMBER_IN_HEADER = re.compile(
-    r"(?:№|No\.?|N[º°]?)\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/]{0,48})",
+
+# Номер: не захватываем "Экземпляр №" (подпись у графы экземпляра).
+_NUMBER_AFTER_SYMBOL = re.compile(
+    r"(?<!экземпляр\s)(?<!экз\s)"  # предшествующие слова исключаем
+    r"(?:№|No\.?|N[º°]?)\s*[:\-–—]?\s*"
+    r"([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{0,48})",
     re.IGNORECASE,
 )
+# Запасной: номер вплотную к "№" без пробела («№7145/Б»)
+_NUMBER_STICKY = re.compile(
+    r"(?:№|No\.?)\s*\n?\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{0,48})",
+    re.IGNORECASE,
+)
+
 _WAYBILL_HEADER = re.compile(
     r"транспортн(?:ая|ой)\s+накладн(?:ая|ой)", re.IGNORECASE
 )
 
-# Служебные строки, которые надо пропускать в начале раздела «Грузоотправитель»:
-# «является экспедитором» (с чекбоксом), «(реквизиты, позволяющие …)», и т. п.
+# Строки-служебки, которые надо пропустить в начале раздела контрагента.
 _SERVICE_LINE_RE = re.compile(
     r"^(?:"
     r"является\s+(?:экспедитором|грузоотправителем)"
     r"|\(\s*реквизиты\b"
-    r"|да\b|нет\b"
-    r"|\[[ xх×✓✔]?\]"   # чекбоксы
     r"|полное\s+наименование"
     r"|сокращ\w*\s+наименование"
     r"|наименование\s+(?:юр|лица)"
-    r"|фио|ф\.и\.о"
+    r"|фио\b|ф\.?и\.?о\.?"
+    r"|экземпляр\s*№?"
+    r"|реквизиты\s+документа"
+    r"|да\b|нет\b"
+    r"|[\[\(][\s xх×✓✔][\]\)]"   # чекбоксы
+    r"|[\-–—=_\s]{3,}"            # разделители из дефисов
+    r"|\([а-яА-Я]+\)"             # короткие пометки в скобках: «(а)», «(б)»
     r")",
     re.IGNORECASE,
 )
 
 
+def _is_service_or_empty(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    # Целиком в скобках: «(реквизиты, позволяющие…)»
+    if re.match(r"^\(.+\)\s*$", s):
+        return True
+    if _SERVICE_LINE_RE.match(s):
+        return True
+    return False
+
+
+def _meaningful_lines(body: str) -> List[str]:
+    """Разбиваем тело секции на строки, выкидываем служебные."""
+    if not body:
+        return []
+    out = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if _is_service_or_empty(line):
+            continue
+        # Строки с инструкцией-пояснением в стиле «(…текст…)» после значения:
+        # «Самовывоз  (реквизиты, позволяющие…)» — чистим хвост.
+        line = re.sub(r"\s*\([^)]*реквизиты[^)]*\)\s*$", "", line, flags=re.IGNORECASE)
+        line = line.strip(" \t,;")
+        if line and not is_garbage(line):
+            out.append(line)
+    return out
+
+
+# ---------------------------------------------------------------------------
+
+
 def extract_number_and_date(
     head: str, full_text: str
 ) -> Tuple[str, float, str, float]:
-    """Возвращает (number, conf_number, date, conf_date)."""
+    """Возвращает (number, conf_number, date, conf_date).
+
+    Поиск номера:
+        1) После «Транспортная накладная» ищем № + значение в 400 символах.
+        2) Если не вышло — сканируем весь текст, пропуская «Экземпляр №».
+    """
     number = MISSING
     conf_num = 0.0
     date = MISSING
     conf_date = 0.0
 
+    def _pick_number(region: str, base_conf: float) -> Tuple[str, float]:
+        # Собираем все кандидаты и выбираем первый непустой/осмысленный.
+        for rx in (_NUMBER_STICKY, _NUMBER_AFTER_SYMBOL):
+            for m in rx.finditer(region):
+                # Проверяем, не «Экземпляр №» ли это (контекст слева 15 симв).
+                left_ctx = region[max(0, m.start() - 20): m.start()].lower()
+                if "экземпляр" in left_ctx or "экз." in left_ctx:
+                    continue
+                candidate = m.group(1).strip(" .,:;")
+                if not candidate:
+                    continue
+                if candidate.lower() in ("экземпляр", "экз"):
+                    continue
+                if is_garbage(candidate):
+                    continue
+                return candidate, base_conf
+        return MISSING, 0.0
+
     source = head if head else full_text
-    if not source:
-        return number, conf_num, date, conf_date
+    if source:
+        anchor = _WAYBILL_HEADER.search(source)
+        if anchor:
+            tail = source[anchor.end(): anchor.end() + 500]
+            number, conf_num = _pick_number(tail, 0.9 if head else 0.6)
+            date_m = _DATE_ANY.search(tail)
+            if date_m and is_valid_date(date_m.group(1)):
+                date = date_m.group(1)
+                conf_date = 1.0 if head else 0.7
 
-    anchor = _WAYBILL_HEADER.search(source)
-    if anchor:
-        tail = source[anchor.end() : anchor.end() + 400]
-        num_m = _NUMBER_IN_HEADER.search(tail)
-        if num_m:
-            candidate = num_m.group(1).strip(" .,:;")
-            if not is_garbage(candidate):
-                number = candidate
-                conf_num = 0.9 if head else 0.6
-        date_m = _DATE_ANY.search(tail)
-        if date_m and is_valid_date(date_m.group(1)):
-            date = date_m.group(1)
-            conf_date = 1.0 if head else 0.7
-
-    # Запасные эвристики по всему тексту.
+    # Резерв: ищем по всему тексту.
     if number == MISSING and full_text:
-        m = _NUMBER_IN_HEADER.search(full_text[:500])
-        if m:
-            candidate = m.group(1).strip(" .,:;")
-            if not is_garbage(candidate):
-                number = candidate
-                conf_num = 0.5
+        number, c = _pick_number(full_text[:1200], 0.5)
+        conf_num = c if number != MISSING else 0.0
     if date == MISSING and full_text:
         for m in _DATE_ANY.finditer(full_text):
             if is_valid_date(m.group(1)):
@@ -92,43 +159,34 @@ def extract_number_and_date(
     return number, conf_num, date, conf_date
 
 
-def _skip_service_lines(lines):
-    """Пропускает «мусорные» служебные строки в начале раздела контрагента."""
-    result = []
-    for ln in lines:
-        if _SERVICE_LINE_RE.match(ln.strip()):
-            # Если на той же строке после заглушки есть значение — сохраняем его.
-            m = re.split(r"[:\-–—]", ln, maxsplit=1)
-            if len(m) == 2 and m[1].strip() and not _SERVICE_LINE_RE.match(m[1].strip()):
-                result.append(m[1].strip())
-            continue
-        result.append(ln)
-    return result
+# ---------------------------------------------------------------------------
 
 
-def extract_org(section_body: str, full_text: str, fallback_kw: str) -> Tuple[str, float]:
+def extract_org(
+    section_body: str,
+    full_text: str,
+    fallback_kw: str,
+    max_lines: int = 4,
+    max_len: int = 500,
+) -> Tuple[str, float]:
     """Извлекает реквизиты контрагента из раздела.
 
-    Берёт первые непустые строки (пропуская чекбоксы и подсказки), склеивает
-    до 3 первых — чтобы получить «ООО … адрес … ИНН …».
+    Берём до max_lines непустых не-служебных строк и склеиваем через «, ».
+    Это даёт «ООО …, адрес, ИНН …, КПП …». Для карьера в табличной форме
+    также ловим «Самовывоз, Рябов В.К.» — обе колонки в одной ячейке.
     """
     if section_body:
-        lines = [ln.strip(" \t") for ln in section_body.splitlines() if ln.strip()]
-        lines = _skip_service_lines(lines)
-        # Отбрасываем одиночные поясняющие строки вида "(реквизиты ...)".
-        lines = [ln for ln in lines if not re.match(r"^\(.+\)$", ln)]
+        lines = _meaningful_lines(section_body)
         if lines:
-            # Склеиваем первые 3 строки — обычно этого хватает на название +
-            # адрес + ИНН/КПП. Дальше идут телефоны и подписи, которые нам
-            # в колонке не нужны.
-            joined = ", ".join(ln.rstrip(",") for ln in lines[:3])
-            joined = joined[:500].strip(" ,;")
+            joined = ", ".join(ln.rstrip(",") for ln in lines[:max_lines])
+            joined = joined[:max_len].strip(" ,;")
             if joined and not is_garbage(joined):
                 return joined, 0.9
 
     if full_text and fallback_kw:
         pat = re.compile(
-            rf"{fallback_kw}\s*[:\-–—]?\s*([^\n\r]{{2,350}})", re.IGNORECASE
+            rf"{fallback_kw}\s*[:\-–—]?\s*\n?\s*([^\n\r]{{2,350}})",
+            re.IGNORECASE,
         )
         m = pat.search(full_text)
         if m:
@@ -140,40 +198,53 @@ def extract_org(section_body: str, full_text: str, fallback_kw: str) -> Tuple[st
     return MISSING, 0.0
 
 
+# ---------------------------------------------------------------------------
+
+
 def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
+    """Извлекает наименование груза, снимая префикс «Наименование —»."""
     if section_body:
-        lines = [ln.strip() for ln in section_body.splitlines() if ln.strip()]
-        cleaned: list[str] = []
+        lines = _meaningful_lines(section_body)
+        cleaned: List[str] = []
         for ln in lines:
             low = ln.lower()
-            # "1. Наименование — Блок …" или "Наименование: X" — берём X.
+
+            # "1. Наименование — Блок облицовочный…" → «Блок облицовочный…»
             m = re.match(
-                r"^\s*(?:\d+\.\s*)?наимен\w*\s*[:\-–—]\s*(.+)$",
+                r"^\s*(?:\d+[.)]\s*)?наимен\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*(.+)$",
                 ln, re.IGNORECASE,
             )
             if m and m.group(1).strip():
                 cleaned.append(m.group(1).strip())
                 continue
-            # Просто "Груз: X".
-            if low.startswith("груз:"):
-                parts = re.split(r":", ln, maxsplit=1)
+            # "Груз: X"
+            if low.startswith("груз:") or low.startswith("груз —"):
+                parts = re.split(r"[:\-–—]", ln, maxsplit=1)
                 if len(parts) == 2 and parts[1].strip():
                     cleaned.append(parts[1].strip())
                 continue
-            # Чисто измерительные строки — пропускаем.
-            if re.match(r"^(ед\.\s*изм|кол-во|количес|масс|объ[её]м|нетто|брутто)\b", low):
+            # Пропускаем чисто измерительные строки.
+            if re.match(
+                r"^(ед\.\s*изм|кол-во|количес|масс|объ[её]м|нетто|брутто|в том числе)\b",
+                low,
+            ):
+                continue
+            # Пропускаем строки без единой буквы (только числа и знаки —
+            # обычно «20,52 т., 20,835 т., 8,73 м³»).
+            if not re.search(r"[А-Яа-яЁёA-Za-z]{3,}", ln):
                 continue
             cleaned.append(ln)
+
         if cleaned:
             joined = " ".join(cleaned[:3])
-            joined = joined[:400].strip()
+            joined = joined[:400].strip(" ,;")
             if joined and not is_garbage(joined):
                 return joined, 0.9
 
     if full_text:
         for pat in (
-            r"наименовани\w*\s+груз\w*\s*[:\-–—]?\s*([^\n\r]{2,400})",
-            r"наименовани\w*\s*[:\-–—]\s*([^\n\r]{2,400})",
+            r"наименовани\w*\s+груз\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*([^\n\r]{2,400})",
+            r"наименовани\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*([^\n\r]{2,400})",
         ):
             m = re.search(pat, full_text, re.IGNORECASE)
             if m:
@@ -184,46 +255,75 @@ def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
     return MISSING, 0.0
 
 
+# ---------------------------------------------------------------------------
+
+
+def _compact_grz_search(region: str) -> Optional[str]:
+    """Схлопываем пробелы внутри буквенно-цифровых кластеров и ищем ГРЗ."""
+    compact = re.sub(
+        r"(?<=[А-ЯЁA-Z0-9])\s+(?=[А-ЯЁA-Z0-9])", "", region.upper()
+    )
+    grz = find_grz(compact)
+    if grz and is_valid_grz(grz):
+        return grz
+    return None
+
+
 def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
-    """Транспортное средство: ищем сначала ГРЗ (валидированный), затем марку."""
+    """Транспортное средство: марка + ГРЗ в одной ячейке.
+
+    Формат вывода — «RENAULT Р 814 НР 152»: сначала марка (если есть),
+    потом канонический ГРЗ. Если марки нет — только ГРЗ.
+    """
     if section_body:
-        # Уберём пробелы внутри возможного ГРЗ перед проверкой: "Р 814 НР 152".
-        candidate_text = section_body.upper()
-        compact = re.sub(r"(?<=[А-Я0-9])\s+(?=[А-Я0-9])", "", candidate_text)
-        grz = find_grz(compact)
-        if grz and is_valid_grz(grz):
+        grz = _compact_grz_search(section_body)
+
+        # Строки без служебки и без "(тип, марка …)"-подсказок.
+        lines = _meaningful_lines(section_body)
+
+        # Фильтруем подсказки-пометки вроде «(тип, марка, грузоподъемность…)».
+        def _is_hint(ln: str) -> bool:
+            low = ln.lower()
+            return bool(re.match(r"^\((тип|марка|модель|регистрационн|рег\.?)", low))
+
+        lines = [ln for ln in lines if not _is_hint(ln)]
+
+        # Разделяем строки с меткой «Марка:», «Модель:» и без.
+        marka_parts: List[str] = []
+        for ln in lines:
+            low = ln.lower()
+            if low.startswith(("марка", "модель", "тип", "т/с")):
+                parts = re.split(r"[:\-–—]", ln, maxsplit=1)
+                if len(parts) == 2 and parts[1].strip():
+                    marka_parts.append(parts[1].strip())
+                continue
+            # Строка, в которой есть ГРЗ — игнорируем.
+            if grz and grz in re.sub(r"\s+", "", ln.upper()):
+                continue
+            # Строки с инн/кпп — точно не ТС.
+            if re.search(r"\b(инн|кпп|огрн|окпо)\b", low):
+                continue
+            # Похоже на название марки (буквы/цифры, короткая).
+            if 2 <= len(ln) <= 60:
+                marka_parts.append(ln)
+
+        if grz:
             pretty = format_grz(grz)
-            # Дополнительная марка/модель, если рядом.
-            extra = []
-            for line in section_body.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                low = line.lower()
-                if low.startswith(("марка", "модель", "тип")):
-                    parts = re.split(r"[:\-–—]", line, maxsplit=1)
-                    if len(parts) == 2 and parts[1].strip():
-                        extra.append(parts[1].strip())
-                        if len(extra) >= 2:
-                            break
-            if extra:
-                return f"{pretty} ({'; '.join(extra)})", 1.0
+            if marka_parts:
+                # Берём ПЕРВУЮ содержательную часть (обычно марка в верхней строке).
+                marka = marka_parts[0].strip(" ,;")
+                return f"{marka} {pretty}", 1.0
             return pretty, 1.0
 
-        # ГРЗ не нашли — берём первую содержательную непустую строку.
-        lines = [ln.strip() for ln in section_body.splitlines() if ln.strip()]
+        # ГРЗ не нашли, но раздел есть — отдаём первую содержательную строку.
         if lines:
-            first = lines[0]
-            if not is_garbage(first):
-                return first[:80], 0.6
+            return lines[0][:80], 0.5
 
-    # ГРЗ где-то в тексте.
+    # Фоллбэк — ищем ГРЗ во всём тексте.
     if full_text:
-        compact_full = re.sub(r"(?<=[А-ЯA-Z0-9])\s+(?=[А-ЯA-Z0-9])", "", full_text.upper())
-        grz = find_grz(compact_full)
-        if grz and is_valid_grz(grz):
-            return format_grz(grz), 0.7
-
+        grz = _compact_grz_search(full_text)
+        if grz:
+            return format_grz(grz), 0.6
         for pat in (
             r"гос\.?\s*номер\s*[:\-–—]?\s*([^\n\r]{2,40})",
             r"рег\.?\s*знак\s*[:\-–—]?\s*([^\n\r]{2,40})",
@@ -233,37 +333,76 @@ def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
             if m:
                 candidate = clean_value(m.group(1), MISSING, GARBAGE)
                 if candidate not in (MISSING, GARBAGE):
-                    return candidate, 0.5
+                    return candidate, 0.4
 
     return MISSING, 0.0
 
 
+# ---------------------------------------------------------------------------
+
+
 _RECEPTION_STOP = re.compile(
     r"\n\s*(?:"
-    r"\d{1,2}[.)\s]*\s*(?:выдача\s+груз|переадресовк|отметк|стоимость|прочие\s+условия)"
+    r"\d{1,2}\s*[.)]\s*(?:выдача\s+груз|переадресовк|отметк|стоимость|прочие\s+условия)"
     r"|сдач\w*\s+груз"
     r"|выдач\w*\s+груз"
     r"|доставк\w*\s+груз"
     r"|переадресовк"
-    r"|отметк\w*"
+    r"|отметк\w+\s+грузоотпр"
     r")",
     re.IGNORECASE,
 )
 
+# Строка считается мусорной, если <30% символов — буквы/цифры, и в ней
+# много «технических» символов (скобки/слэши/подчёркивания, длинные серии
+# одиночных пробелов).
+_RECEPTION_NOISE_CHARS = set("[](){}|\\/=_~^`<>*#$%")
+
+
+def _looks_noisy(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    alnum = sum(1 for c in s if c.isalnum())
+    if alnum == 0:
+        return True
+    if len(s) >= 4 and alnum / len(s) < 0.3:
+        return True
+    noise = sum(1 for c in s if c in _RECEPTION_NOISE_CHARS)
+    if noise >= 3 and noise / max(len(s), 1) > 0.3:
+        return True
+    # Подряд идущие короткие «токены» из 1-2 символов — это почти всегда
+    # OCR-мусор на границе ячеек таблицы.
+    tokens = s.split()
+    if len(tokens) >= 4:
+        short = sum(1 for t in tokens if len(t) <= 2)
+        if short / len(tokens) > 0.6:
+            return True
+    return False
+
 
 def extract_reception(section_body: str, full_text: str) -> Tuple[str, float]:
+    """Приём груза с агрессивной чисткой OCR-шума."""
     if section_body:
         body = _RECEPTION_STOP.split(section_body, maxsplit=1)[0]
-        body = body[:1500].strip()
-        if body and not is_garbage(body):
-            return body, 0.9
+        lines = [ln for ln in body.splitlines() if not _looks_noisy(ln)]
+        lines = [ln.strip() for ln in lines if ln.strip()]
+        # Отбрасываем повторный блок с реквизитами грузоотправителя, если
+        # он идёт ВТОРЫМ (такое бывает, когда «Приём груза» копирует контент
+        # из раздела 1 — нам это неинтересно, у нас уже есть shipper).
+        if lines:
+            body_clean = "\n".join(lines[:12])[:1200].strip()
+            if body_clean and not is_garbage(body_clean):
+                return body_clean, 0.9
 
     if full_text:
         m = re.search(r"при[ёе]м\s+груз\w*", full_text, re.IGNORECASE)
         if m:
             chunk = full_text[m.end(): m.end() + 1500]
             chunk = _RECEPTION_STOP.split(chunk, maxsplit=1)[0]
-            cleaned = clean_value(chunk, MISSING, GARBAGE)
+            lines = [ln for ln in chunk.splitlines() if not _looks_noisy(ln)]
+            cleaned = "\n".join(ln.strip() for ln in lines if ln.strip())[:1200]
+            cleaned = clean_value(cleaned, MISSING, GARBAGE)
             if cleaned not in (MISSING, GARBAGE):
                 return cleaned, 0.5
 
@@ -286,7 +425,8 @@ def extract_all(sections: Dict[str, str], full_text: str) -> Dict[str, Tuple[str
         sections.get("consignee", ""), full_text, "грузополучатель"
     )
     carrier, c_carrier = extract_org(
-        sections.get("carrier", ""), full_text, "перевозчик"
+        sections.get("carrier", ""), full_text, "перевозчик",
+        max_lines=3, max_len=300,
     )
     cargo, c_cargo = extract_cargo(sections.get("cargo", ""), full_text)
     vehicle, c_vehicle = extract_vehicle(sections.get("vehicle", ""), full_text)

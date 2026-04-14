@@ -3,19 +3,16 @@
 
 Формы ТН бывают разных редакций: нумерация разделов гуляет (например, в
 форме из ПП №2200 «Перевозчик» — раздел 10, а в старой форме — раздел 6).
-Поэтому вместо ключей-номеров мы возвращаем `Dict[role, content]`, где
-role — это одна из фиксированных строк:
+Поэтому вместо ключей-номеров мы возвращаем `Dict[role, content]`.
 
-    "head"      — всё, что до первого опознанного раздела (шапка)
+Ключи:
+    "head"      — всё до первого опознанного раздела
     "shipper"   — грузоотправитель
     "consignee" — грузополучатель
     "cargo"     — груз
     "carrier"   — перевозчик
     "vehicle"   — транспортное средство
     "reception" — приём груза
-
-Разделы, которые нам не нужны (сопроводительные документы, переадресовка,
-отметки, стоимость) просто игнорируются.
 """
 
 from __future__ import annotations
@@ -24,19 +21,18 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 
-# Канонические начала заголовков. Порядок важен: более длинные (и потому более
-# специфичные) идут первыми, чтобы «Приём груза» не перекрывалось «Груз».
+# Канонические начала заголовков. Более длинные/специфичные — первыми,
+# чтобы «Приём груза» не перекрывалось «Груз».
 _ROLE_TITLES: List[Tuple[str, Tuple[str, ...]]] = [
     ("reception", ("прием груза", "приём груза", "погрузка груза")),
     ("consignee", ("грузополучатель",)),
     ("shipper", ("грузоотправитель",)),
     ("vehicle", ("транспортное средство",)),
     ("carrier", ("перевозчик",)),
-    ("cargo", ("груз",)),  # самое короткое — последнее
+    ("cargo", ("груз",)),
 ]
 
-# Заголовки, которые мы узнаём, но контент нам не нужен. Главное — использовать
-# их как стоп-маркеры (границы следующего раздела).
+# Заголовки, которые мы узнаём как стоп-маркеры, но контент не забираем.
 _IGNORED_TITLES: Tuple[str, ...] = (
     "сопроводительные документы",
     "указания грузоотправителя",
@@ -54,25 +50,28 @@ _IGNORED_TITLES: Tuple[str, ...] = (
 )
 
 
-# "1. ", "1)", "1 ." — в начале строки, плюс заглавная буква.
-_NUMBERED = re.compile(r"(?m)^\s*(\d{1,2})[.)\u00a0]\s*([А-ЯЁ][^\n]{0,80})")
+# Заголовок с номером: «1.», «2)», «6 .», нестрогий разделитель.
+_NUMBERED = re.compile(
+    r"(?m)^\s*(\d{1,2})\s*[.)\u00a0]\s*([А-ЯЁа-яё][^\n]{0,80})"
+)
 
-# Заголовок без номера (на случай повреждённого текстового слоя).
-_BARE_TITLE_RE = re.compile(
+# Заголовок без номера — отдельной строкой.
+_BARE = re.compile(
     r"(?mi)^\s*("
     + "|".join(
         re.escape(name)
         for _, names in _ROLE_TITLES
         for name in names
     )
+    + r"|"
+    + "|".join(re.escape(name) for name in _IGNORED_TITLES)
     + r")\b[^\n]{0,80}$"
 )
 
 
 def _classify_title(title: str) -> Optional[str]:
-    """По тексту заголовка раздела определяет роль (или None)."""
+    """По тексту заголовка определяет роль или "__ignored__"."""
     low = title.lower().strip()
-    # Отбрасываем явно игнорируемые.
     for ign in _IGNORED_TITLES:
         if low.startswith(ign):
             return "__ignored__"
@@ -84,47 +83,45 @@ def _classify_title(title: str) -> Optional[str]:
 
 
 def _find_markers(text: str) -> List[Tuple[int, str]]:
-    """Возвращает список (offset, role | "__ignored__") в порядке появления.
+    """Возвращает отсортированный список (offset, role|"__ignored__").
 
-    Игнорируемые разделы тоже участвуют — они нужны как границы между
-    интересующими нас.
+    Стратегия: собираем все возможные маркеры (нумерованные + bare), затем
+    для каждой роли оставляем ПЕРВОЕ вхождение. Ignored-маркеры оставляем
+    все — они нужны как границы.
     """
-    markers: List[Tuple[int, str]] = []
-    seen_roles: set[str] = set()
+    candidates: List[Tuple[int, str]] = []
 
-    # 1) Пронумерованные заголовки.
+    # 1) Нумерованные заголовки.
     for m in _NUMBERED.finditer(text):
-        title = m.group(2)
-        role = _classify_title(title)
-        if role is None:
-            continue
-        if role != "__ignored__" and role in seen_roles:
-            continue
-        if role != "__ignored__":
-            seen_roles.add(role)
-        markers.append((m.start(), role))
+        role = _classify_title(m.group(2))
+        if role is not None:
+            candidates.append((m.start(), role))
 
-    # 2) Заголовки без номера (если соответствующей роли ещё не нашли).
-    if not all(r in seen_roles for r, _ in _ROLE_TITLES):
-        for m in _BARE_TITLE_RE.finditer(text):
-            role = _classify_title(m.group(1))
-            if role is None or role == "__ignored__":
-                continue
-            if role in seen_roles:
-                continue
-            seen_roles.add(role)
-            markers.append((m.start(), role))
+    # 2) Голые заголовки (на отдельной строке).
+    for m in _BARE.finditer(text):
+        role = _classify_title(m.group(1))
+        if role is not None:
+            candidates.append((m.start(), role))
 
-    markers.sort(key=lambda x: x[0])
+    # Первое вхождение каждой роли.
+    seen_roles: set[str] = set()
+    markers: List[Tuple[int, str]] = []
+    # Сортируем сначала по позиции.
+    candidates.sort(key=lambda x: x[0])
+    for pos, role in candidates:
+        if role == "__ignored__":
+            markers.append((pos, role))
+            continue
+        if role in seen_roles:
+            continue
+        seen_roles.add(role)
+        markers.append((pos, role))
+
     return markers
 
 
 def split_sections(text: str) -> Dict[str, str]:
-    """Делит нормализованный текст на разделы по их семантической роли.
-
-    Возвращает словарь {role: content}. Ключ «head» — всё до первого маркера.
-    Игнорируемые разделы в словарь не попадают, но используются как границы.
-    """
+    """Делит нормализованный текст на разделы по ролям."""
     if not text:
         return {}
 
@@ -160,7 +157,6 @@ def split_sections(text: str) -> Dict[str, str]:
 
         if role == "__ignored__":
             continue
-        # Первая встреченная секция роли побеждает.
         if role not in result:
             result[role] = body
 

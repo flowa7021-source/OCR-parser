@@ -1,66 +1,80 @@
 # -*- coding: utf-8 -*-
-"""Извлечение текста из PDF с учётом геометрии блоков.
+"""Извлечение текста из PDF с сохранением порядка чтения.
 
-`fitz.Page.get_text("text")` склеивает двухколоночную вёрстку в кашу — номер
-раздела с одной стороны листа оказывается рядом с содержимым совсем другого
-раздела. Поэтому берём блоки с координатами, сортируем и склеиваем с учётом
-вертикальных разрывов.
+Пробуем две стратегии и выбираем ту, что даёт больше содержательного
+текста:
+
+    1. `page.get_text("text")` — собственный порядок чтения PDF. Именно эту
+       текстовую выдачу получает Acrobat при копировании. Для большинства
+       машиночитаемых и OCR-прослоечных PDF это лучший вариант.
+    2. `page.get_text("blocks", sort=True)` — блочная выдача с внутренней
+       сортировкой PyMuPDF. Иногда даёт более чистый результат для табличных
+       форм без нормального порядка чтения.
+
+Результат разделяет страницы символом `\f`.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, List, Tuple
+from typing import List
 
 import fitz  # PyMuPDF
 
 
-# Блок из PyMuPDF: (x0, y0, x1, y1, text, block_no, block_type)
-Block = Tuple[float, float, float, float, str, int, int]
+def _page_text_plain(page) -> str:
+    return page.get_text("text") or ""
 
 
-def _sort_blocks(blocks: Iterable[Block]) -> List[Block]:
-    """Сортировка блоков в порядке чтения.
+def _page_text_blocks(page) -> str:
+    blocks = page.get_text("blocks", sort=True) or []
+    text_blocks = [
+        b for b in blocks
+        if len(b) >= 7 and b[6] == 0 and b[4] and b[4].strip()
+    ]
+    return "\n\n".join(b[4].strip() for b in text_blocks)
 
-    Документы ТН часто двухколоночные. Чтобы не склеить колонки, сортируем по
-    (y_bucket, x0), где y_bucket округляет координату до ~6 пт — это примерно
-    высота строки. Блоки в одной строке тогда группируются слева-направо, а
-    разные строки — сверху-вниз.
+
+def _score_text(text: str) -> int:
+    """Грубая мера «полезности» текста: количество букв+цифр.
+
+    Нужна, чтобы выбрать из двух стратегий ту, что извлекла больше
+    содержательных символов (а не только пробелов и пунктуации).
     """
-    BUCKET = 6.0
-    return sorted(
-        blocks,
-        key=lambda b: (round(b[1] / BUCKET), round(b[0])),
-    )
+    return sum(1 for c in text if c.isalnum())
 
 
-def extract_blocks_text(pdf_path: str) -> str:
-    """PDF → одна строка с блоками, разделёнными `\\n\\n`.
-
-    Между страницами добавляется маркер "\f" (page break), что полезно для
-    дальнейшей сегментации нескольких накладных в одном файле.
-    """
+def extract_best_text(pdf_path: str) -> str:
+    """Главная функция: выбирает лучшую стратегию страница за страницей."""
     doc = fitz.open(pdf_path)
     try:
-        pages_text: List[str] = []
+        pages: List[str] = []
         for page in doc:
-            blocks = page.get_text("blocks") or []
-            # Отбрасываем графические блоки (block_type == 1) — только текст.
-            text_blocks = [b for b in blocks if len(b) >= 7 and b[6] == 0 and b[4]]
-            text_blocks = _sort_blocks(text_blocks)
-            page_parts = [b[4].strip() for b in text_blocks if b[4].strip()]
-            pages_text.append("\n\n".join(page_parts))
-        return "\f".join(pages_text)
+            plain = _page_text_plain(page)
+            blocks = _page_text_blocks(page)
+            # Предпочитаем plain, но переключаемся на blocks, если он ощутимо
+            # богаче (разница > 20%).
+            if _score_text(blocks) > _score_text(plain) * 1.2:
+                pages.append(blocks)
+            else:
+                pages.append(plain)
+        return "\f".join(pages)
+    finally:
+        doc.close()
+
+
+# Сохраняем старые имена для совместимости и для CLI/GUI, где они могут
+# явно вызываться как «резерв».
+def extract_blocks_text(pdf_path: str) -> str:
+    doc = fitz.open(pdf_path)
+    try:
+        return "\f".join(_page_text_blocks(page) for page in doc)
     finally:
         doc.close()
 
 
 def extract_plain_text(pdf_path: str) -> str:
-    """Упрощённое извлечение текста (без геометрии). Запасной вариант."""
     doc = fitz.open(pdf_path)
     try:
-        parts = []
-        for page in doc:
-            parts.append(page.get_text("text") or "")
-        return "\f".join(parts)
+        return "\f".join(_page_text_plain(page) for page in doc)
     finally:
         doc.close()

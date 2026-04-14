@@ -33,6 +33,16 @@ def is_valid_date(s: str) -> bool:
 # 2) Прицеп/такси: АА1234 77 или АА123456.
 # Разрешённые буквы (ГОСТ Р 50577): АВЕКМНОРСТУХ.
 _GRZ_LETTERS = "АВЕКМНОРСТУХ"
+
+# Латинские визуальные двойники для OCR-толерантного поиска.
+_LAT_TO_CYR_GRZ = {
+    "A": "А", "B": "В", "E": "Е", "K": "К", "M": "М",
+    "H": "Н", "O": "О", "P": "Р", "C": "С", "T": "Т",
+    "Y": "У", "X": "Х",
+}
+# Класс символов, который допускает и кириллицу, и её латинских двойников.
+_GRZ_CHAR = f"[{_GRZ_LETTERS}{''.join(_LAT_TO_CYR_GRZ)}]"
+
 _GRZ_MAIN = re.compile(
     rf"^[{_GRZ_LETTERS}]\d{{3}}[{_GRZ_LETTERS}]{{2}}\s?\d{{2,3}}$"
 )
@@ -41,27 +51,38 @@ _GRZ_TRAILER = re.compile(
 )
 
 
+def _cyrillic_grz(raw: str) -> str:
+    """Приводит кандидат ГРЗ к кириллице (A→А, P→Р и т. п.)."""
+    return "".join(_LAT_TO_CYR_GRZ.get(c, c) for c in raw.upper())
+
+
 def is_valid_grz(s: str) -> bool:
     if not s:
         return False
-    candidate = s.upper().replace("  ", " ").strip()
-    # Убираем вкрапления пробелов внутри ядра, сохраняя разрыв перед регионом.
-    core = candidate
-    return bool(_GRZ_MAIN.match(core) or _GRZ_TRAILER.match(core))
+    candidate = _cyrillic_grz(s).replace("  ", " ").strip()
+    return bool(_GRZ_MAIN.match(candidate) or _GRZ_TRAILER.match(candidate))
 
 
+# Поиск кандидата ГРЗ в «сыром» тексте — допускаем и латинские двойники,
+# позже нормализуем в кириллицу.
 GRZ_CANDIDATE = re.compile(
-    rf"[{_GRZ_LETTERS}]\d{{3}}[{_GRZ_LETTERS}]{{2}}\s?\d{{2,3}}|"
-    rf"[{_GRZ_LETTERS}]{{2}}\d{{4}}\s?\d{{2,3}}"
+    rf"{_GRZ_CHAR}\d{{3}}{_GRZ_CHAR}{{2}}\s?\d{{2,3}}|"
+    rf"{_GRZ_CHAR}{{2}}\d{{4}}\s?\d{{2,3}}"
 )
 
 
 def find_grz(text: str) -> Optional[str]:
-    """Находит первое вхождение ГРЗ в тексте (uppercase-normalized)."""
+    """Находит ГРЗ в тексте. Возвращает кандидат в кириллице.
+
+    Если в OCR проскочили латинские двойники (`P 814 HP 152`), приводим
+    их к кириллице перед возвратом (`Р 814 НР 152`).
+    """
     if not text:
         return None
     m = GRZ_CANDIDATE.search(text.upper())
-    return m.group(0).strip() if m else None
+    if not m:
+        return None
+    return _cyrillic_grz(m.group(0)).strip()
 
 
 _GRZ_MAIN_PARTS = re.compile(

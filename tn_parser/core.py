@@ -16,7 +16,7 @@ import tempfile
 from typing import List, Optional
 
 from .fields import extract_all
-from .layout import extract_blocks_text, extract_plain_text
+from .layout import extract_best_text
 from .models import GARBAGE, MISSING, FieldConfidence, ParsedRow
 from .normalize import normalize_for_sections
 from .sections import split_sections
@@ -24,7 +24,7 @@ from .splitter import split_documents
 
 
 LOW_TEXT_THRESHOLD = 200  # символов
-CACHE_VERSION = 4  # ↑ при изменении логики парсинга
+CACHE_VERSION = 5  # ↑ при изменении логики парсинга
 
 
 # ---------------------------------------------------------------------------
@@ -82,10 +82,7 @@ def _cache_put(pdf_path: str, rows: List[ParsedRow]) -> None:
 
 def extract_raw_text(pdf_path: str) -> str:
     """PDF → нормализованный текст с сохранением структуры строк."""
-    try:
-        raw = extract_blocks_text(pdf_path)
-    except Exception:
-        raw = extract_plain_text(pdf_path)
+    raw = extract_best_text(pdf_path)
     return normalize_for_sections(raw)
 
 

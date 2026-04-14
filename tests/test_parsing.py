@@ -106,6 +106,69 @@ class TestRealSample7145B:
         assert "Выдача груза" not in r
 
 
+class TestOcrTabularLayout:
+    """Интеграция на OCR-слое реальной табличной формы ТН №7145/Б.
+
+    Имитирует выдачу PyMuPDF для двухколоночной/табличной формы: ячейки
+    заголовков и значений стоят на разных строках, в разделах 6/7 — два
+    значения (способ | ФИО, марка | ГРЗ).
+    """
+
+    def setup_method(self) -> None:
+        rows = parse_text(_text("tn_ocr_tabular.txt"), "tn_ocr_tabular.pdf")
+        assert len(rows) == 1
+        self.row = rows[0]
+
+    def test_number_not_missed_due_to_ekzemplyar(self):
+        # Рядом стоит «Экземпляр №» — ложный маркер. Правильный номер: 7145/Б.
+        assert self.row.number == "7145/Б"
+        assert self.row.waybill == "Транспортная накладная № 7145/Б"
+
+    def test_date(self):
+        assert self.row.date == "23.07.2022"
+
+    def test_shipper_skips_service_line(self):
+        # «является экспедитором» — служебная подпись, не значение.
+        assert "является экспедитором" not in self.row.shipper.lower()
+        # И не захватывает пояснение в скобках.
+        assert "(реквизиты" not in self.row.shipper
+        assert "Бекам" in self.row.shipper
+        # ИНН/КПП остаются в реквизитах.
+        assert "7743553262" in self.row.shipper
+        assert "504445001" in self.row.shipper
+
+    def test_consignee(self):
+        assert "Моспроект" in self.row.consignee
+        assert "7707820890" in self.row.consignee
+        assert "(реквизиты" not in self.row.consignee
+
+    def test_cargo_strips_prefix(self):
+        assert self.row.cargo.startswith("Блок облицовочный")
+        assert "Наименование" not in self.row.cargo
+        assert "1." not in self.row.cargo[:5]
+
+    def test_carrier_combines_two_columns(self):
+        # Две колонки: «Самовывоз» + «Рябов В.К.».
+        assert "Самовывоз" in self.row.carrier
+        assert "Рябов" in self.row.carrier
+        # Служебные «(реквизиты, позволяющие…)» не попадают.
+        assert "(реквизиты" not in self.row.carrier
+
+    def test_vehicle_combines_marka_and_grz(self):
+        # Формат: «RENAULT Р 814 НР 152».
+        assert "RENAULT" in self.row.vehicle
+        assert "Р 814 НР 152" in self.row.vehicle
+
+    def test_reception_no_next_section_leak(self):
+        r = self.row.reception
+        assert "Подолино" in r
+        assert "Переадресовка" not in r
+        assert "Выдача груза" not in r
+
+    def test_confidence_high(self):
+        assert self.row.confidence.overall() >= 0.85
+
+
 class TestMessyWaybill:
     def setup_method(self) -> None:
         rows = parse_text(_text("tn_messy.txt"), "tn_messy.pdf")
