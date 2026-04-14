@@ -1,0 +1,164 @@
+# -*- coding: utf-8 -*-
+"""Связывающий модуль: PDF → список ParsedRow + кэш.
+
+Публичные функции:
+    extract_raw_text(pdf_path)    — сырой (но нормализованный) текст
+    parse_text(text, source)      — список ParsedRow из текста
+    process_one_pdf(pdf_path)     — основной вход для GUI
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tempfile
+from typing import List, Optional
+
+from .fields import extract_all
+from .layout import extract_blocks_text, extract_plain_text
+from .models import GARBAGE, MISSING, FieldConfidence, ParsedRow
+from .normalize import normalize_for_sections
+from .sections import split_sections
+from .splitter import split_documents
+
+
+LOW_TEXT_THRESHOLD = 200  # символов
+CACHE_VERSION = 3  # ↑ при изменении логики парсинга
+
+
+# ---------------------------------------------------------------------------
+# Кэш
+# ---------------------------------------------------------------------------
+
+
+def _cache_dir() -> str:
+    path = os.path.join(tempfile.gettempdir(), "transport_parser_cache")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _file_signature(pdf_path: str) -> str:
+    try:
+        st = os.stat(pdf_path)
+        raw = f"{os.path.abspath(pdf_path)}|{st.st_size}|{int(st.st_mtime)}|v{CACHE_VERSION}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    except OSError:
+        return ""
+
+
+def _cache_get(pdf_path: str) -> Optional[List[ParsedRow]]:
+    sig = _file_signature(pdf_path)
+    if not sig:
+        return None
+    cache_path = os.path.join(_cache_dir(), sig + ".json")
+    try:
+        with open(cache_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            # Обратная совместимость с предыдущей версией кэша (одна строка).
+            data = [data]
+        return [ParsedRow.from_json_dict(d) for d in data]
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _cache_put(pdf_path: str, rows: List[ParsedRow]) -> None:
+    sig = _file_signature(pdf_path)
+    if not sig:
+        return
+    cache_path = os.path.join(_cache_dir(), sig + ".json")
+    try:
+        with open(cache_path, "w", encoding="utf-8") as fh:
+            json.dump([r.to_json_dict() for r in rows], fh, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Текст
+# ---------------------------------------------------------------------------
+
+
+def extract_raw_text(pdf_path: str) -> str:
+    """PDF → нормализованный текст с сохранением структуры строк."""
+    try:
+        raw = extract_blocks_text(pdf_path)
+    except Exception:
+        raw = extract_plain_text(pdf_path)
+    return normalize_for_sections(raw)
+
+
+# ---------------------------------------------------------------------------
+# Парсинг
+# ---------------------------------------------------------------------------
+
+
+def _build_row(text: str, source: str) -> ParsedRow:
+    sections = split_sections(text)
+    fields = extract_all(sections, text)
+
+    row = ParsedRow(source=source)
+    row.number = fields["number"][0]
+    row.date = fields["date"][0]
+    row.shipper = fields["shipper"][0]
+    row.cargo = fields["cargo"][0]
+    row.carrier = fields["carrier"][0]
+    row.vehicle = fields["vehicle"][0]
+    row.reception = fields["reception"][0]
+
+    row.confidence = FieldConfidence(
+        date=fields["date"][1],
+        number=fields["number"][1],
+        shipper=fields["shipper"][1],
+        cargo=fields["cargo"][1],
+        carrier=fields["carrier"][1],
+        vehicle=fields["vehicle"][1],
+        reception=fields["reception"][1],
+    )
+
+    if row.number not in (MISSING, GARBAGE):
+        row.waybill = f"Транспортная накладная № {row.number}"
+    else:
+        row.waybill = "Транспортная накладная"
+
+    notes = []
+    if len(text) < LOW_TEXT_THRESHOLD:
+        notes.append("LOW_TEXT")
+    if row.confidence.overall() < 0.4:
+        notes.append("LOW_CONF")
+    row.note = ";".join(notes)
+    return row
+
+
+def parse_text(text: str, source: str) -> List[ParsedRow]:
+    """Парсит нормализованный текст, возвращая одну или несколько строк."""
+    if not text or not text.strip():
+        return [ParsedRow.empty_missing(source, note="LOW_TEXT")]
+
+    documents = split_documents(text)
+    rows: List[ParsedRow] = []
+    for i, doc in enumerate(documents):
+        row_source = source if len(documents) == 1 else f"{source}#{i + 1}"
+        rows.append(_build_row(doc, row_source))
+    return rows
+
+
+def process_one_pdf(pdf_path: str, use_cache: bool = True) -> List[ParsedRow]:
+    """Полный цикл обработки одного PDF. Возвращает список ParsedRow."""
+    fname = os.path.basename(pdf_path)
+
+    if use_cache:
+        cached = _cache_get(pdf_path)
+        if cached is not None:
+            return cached
+
+    try:
+        text = extract_raw_text(pdf_path)
+        rows = parse_text(text, fname)
+    except Exception as exc:  # noqa: BLE001
+        return [ParsedRow.empty_missing(fname, note=f"ERROR: {exc}")]
+
+    if use_cache:
+        _cache_put(pdf_path, rows)
+    return rows
