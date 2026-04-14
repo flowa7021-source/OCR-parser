@@ -24,7 +24,7 @@ from .splitter import split_documents
 
 
 LOW_TEXT_THRESHOLD = 200  # символов
-CACHE_VERSION = 3  # ↑ при изменении логики парсинга
+CACHE_VERSION = 4  # ↑ при изменении логики парсинга
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +102,7 @@ def _build_row(text: str, source: str) -> ParsedRow:
     row.number = fields["number"][0]
     row.date = fields["date"][0]
     row.shipper = fields["shipper"][0]
+    row.consignee = fields["consignee"][0]
     row.cargo = fields["cargo"][0]
     row.carrier = fields["carrier"][0]
     row.vehicle = fields["vehicle"][0]
@@ -111,6 +112,7 @@ def _build_row(text: str, source: str) -> ParsedRow:
         date=fields["date"][1],
         number=fields["number"][1],
         shipper=fields["shipper"][1],
+        consignee=fields["consignee"][1],
         cargo=fields["cargo"][1],
         carrier=fields["carrier"][1],
         vehicle=fields["vehicle"][1],

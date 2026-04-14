@@ -14,10 +14,8 @@ from typing import Dict, Optional, Tuple
 from .normalize import clean_value, is_garbage
 from .validators import (
     find_grz,
-    find_inn,
     is_valid_date,
     is_valid_grz,
-    is_valid_inn,
 )
 from .models import MISSING, GARBAGE
 
@@ -38,25 +36,47 @@ _WAYBILL_HEADER = re.compile(
     r"транспортн(?:ая|ой)\s+накладн(?:ая|ой)", re.IGNORECASE
 )
 
+# Служебные строки, которые надо пропускать в начале раздела «Грузоотправитель»:
+# «является экспедитором» (с чекбоксом), «(реквизиты, позволяющие …)», и т. п.
+_SERVICE_LINE_RE = re.compile(
+    r"^(?:"
+    r"является\s+(?:экспедитором|грузоотправителем)"
+    r"|\(\s*реквизиты\b"
+    r"|да\b|нет\b"
+    r"|\[[ xх×✓✔]?\]"   # чекбоксы
+    r"|полное\s+наименование"
+    r"|сокращ\w*\s+наименование"
+    r"|наименование\s+(?:юр|лица)"
+    r"|фио|ф\.и\.о"
+    r")",
+    re.IGNORECASE,
+)
+
 
 def _truncate_at_terminator(s: str, max_len: int = 250) -> str:
-    """Обрезает строку у первого терминатора (ИНН, КПП, телефон и т. п.)."""
+    """Обрезает строку у первого терминатора (ИНН, КПП, телефон и т. п.).
+
+    ВАЖНО: для ТН мы, наоборот, хотим оставить реквизиты (ИНН/КПП/адрес)
+    в значении поля «Грузоотправитель»/«Грузополучатель», потому что именно
+    они однозначно идентифицируют контрагента. Поэтому по умолчанию функция
+    возвращает строку БЕЗ обрезки и используется только там, где хвост —
+    шум следующего раздела.
+    """
+    if not s:
+        return s
+    return s[:max_len].strip()
+
+
+def _trim_organization(s: str, max_len: int = 400) -> str:
+    """Чуть более агрессивная обрезка — для одиночной строки 'после двоеточия',
+    где дальше идёт мусор."""
     if not s:
         return s
     s = s.strip()
     m = _ORG_TERMINATOR_RE.search(s)
-    if m:
-        s = s[: m.start()].rstrip(" \t,:;–—-.")
+    # Оставляем ИНН/КПП — это часть ценных реквизитов. Обрезаем только телефон
+    # и явные «мусорные» маркеры.
     return s[:max_len].strip()
-
-
-def _value_or_missing(v: Optional[str]) -> Tuple[str, float]:
-    v = clean_value(v or "", MISSING, GARBAGE)
-    if v == MISSING:
-        return MISSING, 0.0
-    if v == GARBAGE:
-        return GARBAGE, 0.0
-    return v, 0.7  # значение найдено в своём разделе
 
 
 # ---------------------------------------------------------------------------
@@ -65,10 +85,7 @@ def _value_or_missing(v: Optional[str]) -> Tuple[str, float]:
 def extract_number_and_date(
     head: str, full_text: str
 ) -> Tuple[str, float, str, float]:
-    """Возвращает (number, conf_number, date, conf_date).
-
-    Ищем в «шапке» ТН: `Транспортная накладная № 12345 от 01.02.2024`.
-    """
+    """Возвращает (number, conf_number, date, conf_date)."""
     number = MISSING
     conf_num = 0.0
     date = MISSING
@@ -78,7 +95,6 @@ def extract_number_and_date(
     if not source:
         return number, conf_num, date, conf_date
 
-    # Ищем последовательность «Транспортная накладная № … от …»
     anchor = _WAYBILL_HEADER.search(source)
     if anchor:
         tail = source[anchor.end() : anchor.end() + 400]
@@ -111,37 +127,49 @@ def extract_number_and_date(
     return number, conf_num, date, conf_date
 
 
-def extract_org(section_body: str, full_text: str, fallback_kw: str) -> Tuple[str, float]:
-    """Извлекает название организации из раздела.
+def _skip_service_lines(lines):
+    """Пропускает «мусорные» служебные строки в начале раздела контрагента."""
+    result = []
+    for ln in lines:
+        if _SERVICE_LINE_RE.match(ln.strip()):
+            # Если на той же строке после заглушки есть значение — сохраняем его.
+            m = re.split(r"[:\-–—]", ln, maxsplit=1)
+            if len(m) == 2 and m[1].strip() and not _SERVICE_LINE_RE.match(m[1].strip()):
+                result.append(m[1].strip())
+            continue
+        result.append(ln)
+    return result
 
-    Берёт первую непустую строку, обрезает у организационных терминаторов.
-    Если раздел пуст — ищет ключевое слово в общем тексте.
+
+def extract_org(section_body: str, full_text: str, fallback_kw: str) -> Tuple[str, float]:
+    """Извлекает реквизиты контрагента из раздела.
+
+    Берёт первые непустые строки (пропуская чекбоксы и подсказки), склеивает
+    до 3 первых — чтобы получить «ООО … адрес … ИНН …».
     """
     if section_body:
-        # Пропускаем служебные подзаголовки вроде "Полное наименование:".
-        lines = [ln.strip(" \t:-–—") for ln in section_body.splitlines() if ln.strip()]
-        for line in lines:
-            low = line.lower()
-            if low.startswith(("полное наименование", "сокращ", "фио", "ф.и.о", "наимен")):
-                # Значение может быть на этой же строке после двоеточия.
-                parts = re.split(r"[:\-–—]", line, maxsplit=1)
-                if len(parts) == 2 and parts[1].strip():
-                    candidate = _truncate_at_terminator(parts[1])
-                    if candidate and not is_garbage(candidate):
-                        return candidate, 1.0
-                continue
-            candidate = _truncate_at_terminator(line)
-            if candidate and not is_garbage(candidate) and len(candidate) > 2:
-                return candidate, 0.9
+        lines = [ln.strip(" \t") for ln in section_body.splitlines() if ln.strip()]
+        lines = _skip_service_lines(lines)
+        # Отбрасываем одиночные поясняющие строки вида "(реквизиты ...)".
+        lines = [ln for ln in lines if not re.match(r"^\(.+\)$", ln)]
+        if lines:
+            # Склеиваем первые 3 строки — обычно этого хватает на название +
+            # адрес + ИНН/КПП. Дальше идут телефоны и подписи, которые нам
+            # в колонке не нужны.
+            joined = ", ".join(ln.rstrip(",") for ln in lines[:3])
+            joined = joined[:500].strip(" ,;")
+            if joined and not is_garbage(joined):
+                return joined, 0.9
 
     if full_text and fallback_kw:
         pat = re.compile(
-            rf"{fallback_kw}\s*[:\-–—]?\s*([^\n\r]{{2,250}})", re.IGNORECASE
+            rf"{fallback_kw}\s*[:\-–—]?\s*([^\n\r]{{2,350}})", re.IGNORECASE
         )
         m = pat.search(full_text)
         if m:
-            candidate = _truncate_at_terminator(m.group(1))
-            if candidate and not is_garbage(candidate):
+            candidate = m.group(1).strip()
+            if (candidate and not is_garbage(candidate)
+                    and not _SERVICE_LINE_RE.match(candidate)):
                 return candidate, 0.5
 
     return MISSING, 0.0
@@ -153,42 +181,53 @@ def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
         cleaned: list[str] = []
         for ln in lines:
             low = ln.lower()
-            # "Наименование: X" — оставляем X.
-            if low.startswith(("наимен", "груз:")):
-                parts = re.split(r"[:\-–—]", ln, maxsplit=1)
+            # "1. Наименование — Блок …" или "Наименование: X" — берём X.
+            m = re.match(
+                r"^\s*(?:\d+\.\s*)?наимен\w*\s*[:\-–—]\s*(.+)$",
+                ln, re.IGNORECASE,
+            )
+            if m and m.group(1).strip():
+                cleaned.append(m.group(1).strip())
+                continue
+            # Просто "Груз: X".
+            if low.startswith("груз:"):
+                parts = re.split(r":", ln, maxsplit=1)
                 if len(parts) == 2 and parts[1].strip():
                     cleaned.append(parts[1].strip())
                 continue
             # Чисто измерительные строки — пропускаем.
-            if re.match(r"^(ед\.\s*изм|кол-во|количес|масс|объ[её]м)\b", low):
+            if re.match(r"^(ед\.\s*изм|кол-во|количес|масс|объ[её]м|нетто|брутто)\b", low):
                 continue
             cleaned.append(ln)
         if cleaned:
             joined = " ".join(cleaned[:3])
-            joined = _truncate_at_terminator(joined, max_len=400)
+            joined = joined[:400].strip()
             if joined and not is_garbage(joined):
                 return joined, 0.9
 
     if full_text:
-        m = re.search(
+        for pat in (
             r"наименовани\w*\s+груз\w*\s*[:\-–—]?\s*([^\n\r]{2,400})",
-            full_text, re.IGNORECASE,
-        )
-        if m:
-            candidate = _truncate_at_terminator(m.group(1), max_len=400)
-            if candidate and not is_garbage(candidate):
-                return candidate, 0.5
+            r"наименовани\w*\s*[:\-–—]\s*([^\n\r]{2,400})",
+        ):
+            m = re.search(pat, full_text, re.IGNORECASE)
+            if m:
+                candidate = m.group(1).strip()[:400]
+                if candidate and not is_garbage(candidate):
+                    return candidate, 0.5
 
     return MISSING, 0.0
 
 
 def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
     """Транспортное средство: ищем сначала ГРЗ (валидированный), затем марку."""
-    # 1) ГРЗ в разделе 11.
     if section_body:
-        grz = find_grz(section_body)
+        # Уберём пробелы внутри возможного ГРЗ перед проверкой: "Р 814 НР 152".
+        candidate_text = section_body.upper()
+        compact = re.sub(r"(?<=[А-Я0-9])\s+(?=[А-Я0-9])", "", candidate_text)
+        grz = find_grz(compact)
         if grz and is_valid_grz(grz):
-            # Добавляем марку/модель, если она рядом.
+            # Дополнительная марка/модель, если рядом.
             extra = []
             for line in section_body.splitlines():
                 line = line.strip()
@@ -205,13 +244,20 @@ def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
                 return f"{grz} ({'; '.join(extra)})", 1.0
             return grz, 1.0
 
-    # 2) ГРЗ где-то в тексте.
-    grz = find_grz(full_text) if full_text else None
-    if grz and is_valid_grz(grz):
-        return grz, 0.7
+        # ГРЗ не нашли — берём первую содержательную непустую строку.
+        lines = [ln.strip() for ln in section_body.splitlines() if ln.strip()]
+        if lines:
+            first = lines[0]
+            if not is_garbage(first):
+                return first[:80], 0.6
 
-    # 3) Эвристика «гос.номер …».
+    # ГРЗ где-то в тексте.
     if full_text:
+        compact_full = re.sub(r"(?<=[А-ЯA-Z0-9])\s+(?=[А-ЯA-Z0-9])", "", full_text.upper())
+        grz = find_grz(compact_full)
+        if grz and is_valid_grz(grz):
+            return grz, 0.7
+
         for pat in (
             r"гос\.?\s*номер\s*[:\-–—]?\s*([^\n\r]{2,40})",
             r"рег\.?\s*знак\s*[:\-–—]?\s*([^\n\r]{2,40})",
@@ -226,28 +272,31 @@ def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
     return MISSING, 0.0
 
 
+_RECEPTION_STOP = re.compile(
+    r"\n\s*(?:"
+    r"\d{1,2}[.)\s]*\s*(?:выдача\s+груз|переадресовк|отметк|стоимость|прочие\s+условия)"
+    r"|сдач\w*\s+груз"
+    r"|выдач\w*\s+груз"
+    r"|доставк\w*\s+груз"
+    r"|переадресовк"
+    r"|отметк\w*"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def extract_reception(section_body: str, full_text: str) -> Tuple[str, float]:
     if section_body:
-        body = section_body.strip()
-        # Отрезаем возможные хвосты следующего раздела, если сегментатор не справился.
-        body = re.split(
-            r"\n\s*(?:сдач\w* груз|выдач\w* груз|доставк\w* груз)",
-            body, maxsplit=1, flags=re.IGNORECASE,
-        )[0]
-        body = body[:1200].strip()
+        body = _RECEPTION_STOP.split(section_body, maxsplit=1)[0]
+        body = body[:1500].strip()
         if body and not is_garbage(body):
             return body, 0.9
 
     if full_text:
         m = re.search(r"при[ёе]м\s+груз\w*", full_text, re.IGNORECASE)
         if m:
-            chunk = full_text[m.end(): m.end() + 1200]
-            end_m = re.search(
-                r"(сдач\w*\s+груз\w*|выдач\w*\s+груз\w*|доставк\w*\s+груз\w*|отметк\w*)",
-                chunk, re.IGNORECASE,
-            )
-            if end_m:
-                chunk = chunk[: end_m.start()]
+            chunk = full_text[m.end(): m.end() + 1500]
+            chunk = _RECEPTION_STOP.split(chunk, maxsplit=1)[0]
             cleaned = clean_value(chunk, MISSING, GARBAGE)
             if cleaned not in (MISSING, GARBAGE):
                 return cleaned, 0.5
@@ -258,23 +307,30 @@ def extract_reception(section_body: str, full_text: str) -> Tuple[str, float]:
 # ---------------------------------------------------------------------------
 
 
-def extract_all(sections: Dict[int, str], full_text: str) -> Dict[str, Tuple[str, float]]:
+def extract_all(sections: Dict[str, str], full_text: str) -> Dict[str, Tuple[str, float]]:
     """Единая точка: прогоняет все экстракторы и возвращает словарь."""
-    head = sections.get(0, "")
-    sec = lambda n: sections.get(n, "")  # noqa: E731
+    head = sections.get("head", "")
 
     number, c_num, date, c_date = extract_number_and_date(head, full_text)
 
-    shipper, c_shipper = extract_org(sec(1), full_text, "грузоотправитель")
-    carrier, c_carrier = extract_org(sec(10), full_text, "перевозчик")
-    cargo, c_cargo = extract_cargo(sec(3), full_text)
-    vehicle, c_vehicle = extract_vehicle(sec(11), full_text)
-    reception, c_reception = extract_reception(sec(6), full_text)
+    shipper, c_shipper = extract_org(
+        sections.get("shipper", ""), full_text, "грузоотправитель"
+    )
+    consignee, c_consignee = extract_org(
+        sections.get("consignee", ""), full_text, "грузополучатель"
+    )
+    carrier, c_carrier = extract_org(
+        sections.get("carrier", ""), full_text, "перевозчик"
+    )
+    cargo, c_cargo = extract_cargo(sections.get("cargo", ""), full_text)
+    vehicle, c_vehicle = extract_vehicle(sections.get("vehicle", ""), full_text)
+    reception, c_reception = extract_reception(sections.get("reception", ""), full_text)
 
     return {
         "number": (number, c_num),
         "date": (date, c_date),
         "shipper": (shipper, c_shipper),
+        "consignee": (consignee, c_consignee),
         "cargo": (cargo, c_cargo),
         "carrier": (carrier, c_carrier),
         "vehicle": (vehicle, c_vehicle),

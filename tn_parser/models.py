@@ -25,6 +25,7 @@ class FieldConfidence:
     date: float = 0.0
     number: float = 0.0
     shipper: float = 0.0
+    consignee: float = 0.0
     cargo: float = 0.0
     carrier: float = 0.0
     vehicle: float = 0.0
@@ -32,7 +33,7 @@ class FieldConfidence:
 
     def overall(self) -> float:
         values = [
-            self.date, self.number, self.shipper, self.cargo,
+            self.date, self.number, self.shipper, self.consignee, self.cargo,
             self.carrier, self.vehicle, self.reception,
         ]
         return round(sum(values) / len(values), 2) if values else 0.0
@@ -47,6 +48,7 @@ class ParsedRow:
     date: str = ""
     number: str = ""
     shipper: str = ""
+    consignee: str = ""
     cargo: str = ""
     carrier: str = ""
     vehicle: str = ""
@@ -61,6 +63,7 @@ class ParsedRow:
             self.date,
             self.number,
             self.shipper,
+            self.consignee,
             self.cargo,
             self.carrier,
             self.vehicle,
@@ -76,6 +79,7 @@ class ParsedRow:
             date=MISSING,
             number=MISSING,
             shipper=MISSING,
+            consignee=MISSING,
             cargo=MISSING,
             carrier=MISSING,
             vehicle=MISSING,
