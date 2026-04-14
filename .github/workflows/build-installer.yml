@@ -31,7 +31,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller pytest
+
+      - name: Run tests
+        run: python -m pytest -q
 
       - name: Cache PyInstaller build artifacts
         uses: actions/cache@v4

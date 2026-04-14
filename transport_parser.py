@@ -1,35 +1,36 @@
 # -*- coding: utf-8 -*-
-"""
-Парсер транспортных накладных из PDF в Excel.
+"""Парсер транспортных накладных из PDF в Excel.
 
-Десктопное приложение для Windows 10/11 на Python + Tkinter.
-Извлекает данные российских транспортных накладных из машиночитаемых PDF
-по регулярным выражениям и сохраняет результат в форматированный .xlsx.
+Десктопное приложение для Windows 10/11 на Python + Tkinter. Извлекает данные
+российских транспортных накладных (ТН) из машиночитаемых PDF и сохраняет
+результат в форматированный .xlsx + лог-файл с уровнями доверия.
+
+Логика парсинга, записи Excel и формирования лога вынесена в пакет
+`tn_parser/`. Этот модуль — тонкий GUI-слой поверх него.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import queue
-import re
 import sys
-import tempfile
 import threading
 import time
 import tkinter as tk
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, asdict
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Optional
+from typing import List, Optional
 
-import fitz  # PyMuPDF
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+from tn_parser import (
+    ParsedRow,
+    build_log_lines,
+    extract_raw_text,
+    process_batch,
+    write_excel_safe,
+    write_log_safe,
+)
+
 
 # ---------------------------------------------------------------------------
 # Константы
@@ -37,350 +38,7 @@ from openpyxl.utils import get_column_letter
 
 APP_TITLE = "Парсер транспортных накладных"
 OUTPUT_FILENAME = "extraction.xlsx"
-SHEET_NAME = "Extraction"
-LOW_TEXT_THRESHOLD = 200  # символов
-CACHE_VERSION = 2  # увеличить при изменении логики парсинга
-
-COLUMNS = [
-    ("Транспортная накладная", 30),
-    ("Дата", 14),
-    ("№", 15),
-    ("Грузоотправитель", 35),
-    ("Груз", 35),
-    ("Перевозчик", 35),
-    ("Транспортное средство", 22),
-    ("Прием груза", 40),
-    ("Источник файл", 25),
-    ("Примечание", 18),
-]
-
-# ---------------------------------------------------------------------------
-# Прекомпилированные regex-ы (компилируются один раз при импорте)
-# ---------------------------------------------------------------------------
-
-_RE_FLAGS = re.IGNORECASE | re.UNICODE
-
-# Номер документа — по приоритету
-RE_NUMBER = [
-    re.compile(r"транспортн(?:ая|ой)\s+накладн(?:ая|ой)\s*№\s*([^\n\r]{1,50})", _RE_FLAGS),
-    re.compile(r"\bнакладн(?:ая|ой)\b\s*№\s*([^\n\r]{1,50})", _RE_FLAGS),
-    re.compile(r"(?:№|\bN\b)\s*([A-Za-zА-Яа-я0-9\-_/]+)", _RE_FLAGS),
-]
-
-# Дата
-RE_DATE_LABELED = re.compile(r"дата\s*[:№N\-–— ]*\s*(\d{2}\.\d{2}\.\d{4})", _RE_FLAGS)
-RE_DATE_ANY = re.compile(r"(\d{2}\.\d{2}\.\d{4})")
-
-# Грузоотправитель
-RE_SHIPPER = re.compile(r"грузоотправитель\s*[:\-–—]?\s*([^\n\r]{1,250})", _RE_FLAGS)
-
-# Груз
-RE_CARGO = [
-    re.compile(r"наименовани(?:е|я)\s+груз(?:а|ов)\s*[:\-–—]?\s*([^\n\r]{1,400})", _RE_FLAGS),
-    re.compile(r"\bгруз\b\s*[:\-–—]?\s*([^\n\r]{1,400})", _RE_FLAGS),
-]
-
-# Перевозчик
-RE_CARRIER = re.compile(r"перевозчик\s*[:\-–—]?\s*([^\n\r]{1,250})", _RE_FLAGS)
-
-# Транспортное средство
-RE_VEHICLE = [
-    re.compile(r"гос\.?\s*номер\s*[:\-–—]?\s*([^\n\r]{1,40})", _RE_FLAGS),
-    re.compile(r"государственн\w*\s+регистрационн\w*\s+номер\s*[:\-–—]?\s*([^\n\r]{1,40})", _RE_FLAGS),
-    re.compile(r"рег\.?\s*знак\s*[:\-–—]?\s*([^\n\r]{1,40})", _RE_FLAGS),
-    re.compile(r"транспортн\w*\s+средств\w*\s*[:\-–—]?\s*([^\n\r]{1,80})", _RE_FLAGS),
-]
-
-# Приём груза
-RE_RECEPTION_HEADER = re.compile(r"при[ёе]м\s+груз\w*", _RE_FLAGS)
-RE_RECEPTION_END = re.compile(
-    r"(сдач\w*\s+груз\w*|выдач\w*\s+груз\w*|доставк\w*\s+груз\w*|отметк\w*)",
-    _RE_FLAGS,
-)
-
-# Нормализация пробелов
-RE_WHITESPACE = re.compile(r"\s+")
-
-# Проверка мусора
-RE_MEANINGFUL = re.compile(r"[А-Яа-яЁё0-9]")
-
-MISSING = "отсутствует"
-GARBAGE = "неразборчиво"
-
-
-# ---------------------------------------------------------------------------
-# Кэш результатов парсинга
-# ---------------------------------------------------------------------------
-
-
-def _cache_dir() -> str:
-    """Папка кэша в %TEMP% (или эквиваленте). Создаётся при первом доступе."""
-    path = os.path.join(tempfile.gettempdir(), "transport_parser_cache")
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def _file_signature(pdf_path: str) -> str:
-    """Сигнатура файла = sha1(абс.путь | размер | mtime). Дёшево, но надёжно."""
-    try:
-        st = os.stat(pdf_path)
-        raw = f"{os.path.abspath(pdf_path)}|{st.st_size}|{int(st.st_mtime)}|v{CACHE_VERSION}"
-        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-    except OSError:
-        return ""
-
-
-def cache_get(pdf_path: str) -> Optional["ParsedRow"]:
-    sig = _file_signature(pdf_path)
-    if not sig:
-        return None
-    cache_path = os.path.join(_cache_dir(), sig + ".json")
-    try:
-        with open(cache_path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return ParsedRow(**data)
-    except (OSError, ValueError, TypeError):
-        return None
-
-
-def cache_put(pdf_path: str, row: "ParsedRow") -> None:
-    sig = _file_signature(pdf_path)
-    if not sig:
-        return
-    cache_path = os.path.join(_cache_dir(), sig + ".json")
-    try:
-        with open(cache_path, "w", encoding="utf-8") as fh:
-            json.dump(asdict(row), fh, ensure_ascii=False)
-    except OSError:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Структура одной строки результата
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ParsedRow:
-    waybill: str = ""
-    date: str = ""
-    number: str = ""
-    shipper: str = ""
-    cargo: str = ""
-    carrier: str = ""
-    vehicle: str = ""
-    reception: str = ""
-    source: str = ""
-    note: str = ""
-
-    def to_excel_tuple(self):
-        return (
-            self.waybill,
-            self.date,
-            self.number,
-            self.shipper,
-            self.cargo,
-            self.carrier,
-            self.vehicle,
-            self.reception,
-            self.source,
-            self.note,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Извлечение текста и парсинг полей
-# ---------------------------------------------------------------------------
-
-
-def extract_text_from_pdf(pdf_path: str) -> str:
-    """Открывает PDF и извлекает текст со всех страниц (без OCR)."""
-    doc = fitz.open(pdf_path)
-    try:
-        parts = []
-        for page in doc:
-            text = page.get_text("text") or ""
-            parts.append(text)
-        return "\n".join(parts)
-    finally:
-        doc.close()
-
-
-def is_garbage(s: str) -> bool:
-    """Нет ни кириллицы, ни цифр — значит мусор."""
-    return not RE_MEANINGFUL.search(s or "")
-
-
-def _clean(value: str) -> str:
-    """Зачищает мусорные хвосты по краям + проверка на is_garbage."""
-    if not value:
-        return MISSING
-    v = value.strip(" \t\r\n:;,.-–—|")
-    if not v:
-        return MISSING
-    if is_garbage(v):
-        return GARBAGE
-    return v
-
-
-def _first_match(patterns, text: str) -> Optional[str]:
-    for pat in patterns:
-        m = pat.search(text)
-        if m:
-            return m.group(1)
-    return None
-
-
-def parse_fields(raw_text: str, source_filename: str) -> ParsedRow:
-    """Парсит нормализованный текст одного PDF в ParsedRow."""
-    row = ParsedRow(source=source_filename)
-
-    if not raw_text:
-        row.waybill = "Транспортная накладная"
-        row.date = MISSING
-        row.number = MISSING
-        row.shipper = MISSING
-        row.cargo = MISSING
-        row.carrier = MISSING
-        row.vehicle = MISSING
-        row.reception = MISSING
-        row.note = "LOW_TEXT"
-        return row
-
-    text = RE_WHITESPACE.sub(" ", raw_text).strip()
-
-    # Номер
-    raw_number = _first_match(RE_NUMBER, text)
-    row.number = _clean(raw_number) if raw_number else MISSING
-
-    # Колонка «Транспортная накладная»
-    if row.number not in (MISSING, GARBAGE):
-        row.waybill = f"Транспортная накладная № {row.number}"
-    else:
-        row.waybill = "Транспортная накладная"
-
-    # Дата
-    m = RE_DATE_LABELED.search(text)
-    if m:
-        row.date = m.group(1)
-    else:
-        m = RE_DATE_ANY.search(text)
-        row.date = m.group(1) if m else MISSING
-
-    # Грузоотправитель
-    m = RE_SHIPPER.search(text)
-    row.shipper = _clean(m.group(1)) if m else MISSING
-
-    # Груз
-    raw_cargo = _first_match(RE_CARGO, text)
-    row.cargo = _clean(raw_cargo) if raw_cargo else MISSING
-
-    # Перевозчик
-    m = RE_CARRIER.search(text)
-    row.carrier = _clean(m.group(1)) if m else MISSING
-
-    # Транспортное средство
-    raw_vehicle = _first_match(RE_VEHICLE, text)
-    row.vehicle = _clean(raw_vehicle) if raw_vehicle else MISSING
-
-    # Приём груза
-    m = RE_RECEPTION_HEADER.search(text)
-    if m:
-        chunk = text[m.end(): m.end() + 1200]
-        end_m = RE_RECEPTION_END.search(chunk)
-        if end_m:
-            chunk = chunk[: end_m.start()]
-        row.reception = _clean(chunk)
-    else:
-        row.reception = MISSING
-
-    # Примечание
-    if len(text) < LOW_TEXT_THRESHOLD:
-        row.note = "LOW_TEXT"
-    else:
-        row.note = ""
-
-    return row
-
-
-def process_one_pdf(pdf_path: str) -> ParsedRow:
-    """Полный цикл: кэш → извлечь текст → распарсить → сохранить в кэш."""
-    fname = os.path.basename(pdf_path)
-
-    cached = cache_get(pdf_path)
-    if cached is not None:
-        return cached
-
-    try:
-        raw = extract_text_from_pdf(pdf_path)
-        row = parse_fields(raw, fname)
-    except Exception as exc:  # noqa: BLE001
-        row = ParsedRow(
-            waybill="Транспортная накладная",
-            date=MISSING,
-            number=MISSING,
-            shipper=MISSING,
-            cargo=MISSING,
-            carrier=MISSING,
-            vehicle=MISSING,
-            reception=MISSING,
-            source=fname,
-            note=f"ERROR: {exc}",
-        )
-        return row  # ошибки не кэшируем
-
-    cache_put(pdf_path, row)
-    return row
-
-
-# ---------------------------------------------------------------------------
-# Запись Excel
-# ---------------------------------------------------------------------------
-
-
-def write_excel(rows: list[ParsedRow], output_path: str) -> None:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = SHEET_NAME
-
-    thin = Side(style="thin", color="000000")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="4472C4")
-    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    body_font = Font(name="Arial", size=10)
-    body_align = Alignment(horizontal="left", vertical="top", wrap_text=True)
-
-    headers = [c[0] for c in COLUMNS]
-    ws.append(headers)
-    for col_idx, _ in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_align
-        cell.border = border
-
-    for row in rows:
-        ws.append(row.to_excel_tuple())
-
-    last_row = ws.max_row
-    last_col = len(COLUMNS)
-    for r in range(2, last_row + 1):
-        for c in range(1, last_col + 1):
-            cell = ws.cell(row=r, column=c)
-            cell.font = body_font
-            cell.alignment = body_align
-            cell.border = border
-
-    for idx, (_, width) in enumerate(COLUMNS, start=1):
-        ws.column_dimensions[get_column_letter(idx)].width = width
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(last_col)}{max(last_row, 1)}"
-
-    wb.save(output_path)
+LOG_FILENAME = "extraction.log"
 
 
 # ---------------------------------------------------------------------------
@@ -392,8 +50,8 @@ class ParserApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("720x520")
-        self.root.minsize(640, 480)
+        self.root.geometry("760x560")
+        self.root.minsize(680, 500)
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
@@ -423,10 +81,17 @@ class ParserApp:
 
         frame_top.columnconfigure(1, weight=1)
 
+        actions = ttk.Frame(self.root)
+        actions.pack(fill="x", **pad)
         self.run_btn = ttk.Button(
-            self.root, text="▶  Извлечь данные", command=self._on_run, state="disabled"
+            actions, text="▶  Извлечь данные", command=self._on_run, state="disabled"
         )
-        self.run_btn.pack(pady=6)
+        self.run_btn.pack(side="left")
+
+        self.raw_btn = ttk.Button(
+            actions, text="🔍  Сырой текст PDF…", command=self._on_show_raw
+        )
+        self.raw_btn.pack(side="left", padx=8)
 
         self.input_var.trace_add("write", lambda *_: self._refresh_run_state())
         self.output_var.trace_add("write", lambda *_: self._refresh_run_state())
@@ -464,7 +129,47 @@ class ParserApp:
         else:
             self.run_btn.configure(state="disabled")
 
-    # ---- Логирование -------------------------------------------------------
+    # ---- «Сырой текст» -----------------------------------------------------
+
+    def _on_show_raw(self) -> None:
+        initial = self.input_var.get().strip() or os.getcwd()
+        pdf_path = filedialog.askopenfilename(
+            title="Выберите PDF для просмотра",
+            initialdir=initial,
+            filetypes=[("PDF", "*.pdf"), ("Все файлы", "*.*")],
+        )
+        if not pdf_path:
+            return
+
+        try:
+            text = extract_raw_text(pdf_path)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, f"Не удалось прочитать PDF: {exc}")
+            return
+
+        self._open_text_window(os.path.basename(pdf_path), text or "[пусто]")
+
+    def _open_text_window(self, title: str, text: str) -> None:
+        win = tk.Toplevel(self.root)
+        win.title(f"Сырой текст: {title}")
+        win.geometry("820x620")
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=8, pady=8)
+        widget = ScrolledText(frame, wrap="word")
+        widget.pack(fill="both", expand=True)
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+        def copy_all() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+
+        bottom = ttk.Frame(win)
+        bottom.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(bottom, text="Копировать всё", command=copy_all).pack(side="right")
+        ttk.Button(bottom, text="Закрыть", command=win.destroy).pack(side="right", padx=6)
+
+    # ---- Логирование в UI --------------------------------------------------
 
     def _log(self, line: str) -> None:
         self.log.configure(state="normal")
@@ -528,60 +233,93 @@ class ParserApp:
         self.progress_label.configure(text=f"0/{len(pdfs)}")
 
         out_path = os.path.join(out_dir, OUTPUT_FILENAME)
+        log_path = os.path.join(out_dir, LOG_FILENAME)
         self.worker_thread = threading.Thread(
-            target=self._worker, args=(pdfs, out_path), daemon=True
+            target=self._worker,
+            args=(pdfs, in_dir, out_path, log_path),
+            daemon=True,
         )
         self.worker_thread.start()
 
-    def _worker(self, pdfs: list[str], out_path: str) -> None:
+    def _worker(
+        self,
+        pdfs: List[str],
+        input_dir: str,
+        out_path: str,
+        log_path: str,
+    ) -> None:
         t0 = time.time()
         total = len(pdfs)
-        ok_count = 0
-        err_count = 0
-        results: dict[str, ParsedRow] = {}
 
-        # Параллельная обработка: PyMuPDF освобождает GIL во время чтения PDF.
-        max_workers = min(8, max(2, (os.cpu_count() or 2)))
+        def _on_progress(done, total_, pdf_path, rows) -> None:
+            fname = os.path.basename(pdf_path)
+            if rows and rows[0].note.startswith("ERROR:"):
+                self.msg_queue.put(("log", f"Ошибка: {fname} — {rows[0].note[7:]}"))
+            else:
+                avg_pct = round(
+                    sum(r.confidence.overall() for r in rows) / max(len(rows), 1) * 100
+                )
+                extra = f" ({len(rows)} накладных)" if len(rows) > 1 else ""
+                self.msg_queue.put(("log", f"Обработано: {fname} — {avg_pct}%{extra}"))
+            self.msg_queue.put(("progress", done, total_))
+
         try:
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                future_to_path = {pool.submit(process_one_pdf, p): p for p in pdfs}
-                done = 0
-                for fut in as_completed(future_to_path):
-                    pdf_path = future_to_path[fut]
-                    fname = os.path.basename(pdf_path)
-                    try:
-                        row = fut.result()
-                    except Exception as exc:  # noqa: BLE001
-                        row = ParsedRow(
-                            waybill="Транспортная накладная",
-                            date=MISSING, number=MISSING, shipper=MISSING,
-                            cargo=MISSING, carrier=MISSING, vehicle=MISSING,
-                            reception=MISSING, source=fname,
-                            note=f"ERROR: {exc}",
-                        )
-                    results[pdf_path] = row
+            results = process_batch(pdfs, progress=_on_progress)
 
-                    if row.note.startswith("ERROR:"):
-                        err_count += 1
-                        self.msg_queue.put(("log", f"Ошибка: {fname} — {row.note[7:]}"))
-                    else:
-                        ok_count += 1
-                        self.msg_queue.put(("log", f"Обработано: {fname} — OK"))
+            ordered_rows: List[ParsedRow] = []
+            for p in pdfs:
+                ordered_rows.extend(results.get(p, []))
 
-                    done += 1
-                    self.msg_queue.put(("progress", done, total))
+            try:
+                actual_xlsx = write_excel_safe(ordered_rows, out_path)
+            except PermissionError as exc:
+                self.msg_queue.put((
+                    "error",
+                    f"Не удалось сохранить Excel:\n{exc}\n\n"
+                    "Возможно, файл открыт в другой программе или у вас "
+                    "нет прав на запись в эту папку.",
+                ))
+                return
 
-            # Сохраняем строки в исходном порядке (по сортированному списку файлов)
-            ordered_rows = [results[p] for p in pdfs]
-            write_excel(ordered_rows, out_path)
+            if actual_xlsx != out_path:
+                self.msg_queue.put((
+                    "log",
+                    f"⚠ Файл {os.path.basename(out_path)} занят другой программой "
+                    "(вероятно, открыт в Excel).",
+                ))
+                self.msg_queue.put((
+                    "log",
+                    f"  Результат сохранён как {os.path.basename(actual_xlsx)}.",
+                ))
 
             elapsed = time.time() - t0
+            rows_by_fname = {os.path.basename(p): results[p] for p in pdfs if p in results}
+            log_lines = build_log_lines(
+                input_path=input_dir,
+                output_path=actual_xlsx,
+                elapsed_s=elapsed,
+                rows_by_file=rows_by_fname,
+            )
+            try:
+                actual_log = write_log_safe(log_path, log_lines)
+            except PermissionError:
+                actual_log = None  # не критично — просто не запишем лог
+
+            ok_count = sum(
+                1 for rows in results.values()
+                if not any(r.note.startswith("ERROR:") for r in rows)
+            )
+            err_count = len(results) - ok_count
+
             self.msg_queue.put(("log", "──────────────────────────"))
             self.msg_queue.put((
                 "log",
-                f"Итого: {total} файлов, {ok_count} OK, {err_count} ошибок (за {elapsed:.1f} с)",
+                f"Итого: {total} файлов, {ok_count} OK, {err_count} ошибок, "
+                f"{len(ordered_rows)} строк (за {elapsed:.1f} с)",
             ))
-            self.msg_queue.put(("log", f"Сохранено: {out_path}"))
+            self.msg_queue.put(("log", f"Excel: {actual_xlsx}"))
+            if actual_log:
+                self.msg_queue.put(("log", f"Лог:   {actual_log}"))
         except Exception as exc:  # noqa: BLE001
             tb = traceback.format_exc(limit=4)
             self.msg_queue.put(("log", f"Критическая ошибка: {exc}\n{tb}"))
@@ -598,7 +336,6 @@ class ParserApp:
 def main() -> int:
     root = tk.Tk()
     try:
-        # Приоритетно — нативная тема Windows, иначе clam.
         style = ttk.Style(root)
         themes = style.theme_names()
         for preferred in ("vista", "winnative", "clam"):
