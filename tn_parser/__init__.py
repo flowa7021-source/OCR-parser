@@ -23,8 +23,8 @@ from .core import (
     process_batch,
     process_one_pdf,
 )
-from .excel import COLUMNS, write_excel
-from .report import build_log_lines, write_log
+from .excel import COLUMNS, write_excel, write_excel_safe
+from .report import build_log_lines, write_log, write_log_safe
 
 __all__ = [
     "MISSING",
@@ -38,6 +38,8 @@ __all__ = [
     "process_batch",
     "COLUMNS",
     "write_excel",
+    "write_excel_safe",
     "build_log_lines",
     "write_log",
+    "write_log_safe",
 ]

@@ -27,8 +27,8 @@ from tn_parser import (
     build_log_lines,
     extract_raw_text,
     process_batch,
-    write_excel,
-    write_log,
+    write_excel_safe,
+    write_log_safe,
 )
 
 
@@ -269,17 +269,41 @@ class ParserApp:
             ordered_rows: List[ParsedRow] = []
             for p in pdfs:
                 ordered_rows.extend(results.get(p, []))
-            write_excel(ordered_rows, out_path)
+
+            try:
+                actual_xlsx = write_excel_safe(ordered_rows, out_path)
+            except PermissionError as exc:
+                self.msg_queue.put((
+                    "error",
+                    f"Не удалось сохранить Excel:\n{exc}\n\n"
+                    "Возможно, файл открыт в другой программе или у вас "
+                    "нет прав на запись в эту папку.",
+                ))
+                return
+
+            if actual_xlsx != out_path:
+                self.msg_queue.put((
+                    "log",
+                    f"⚠ Файл {os.path.basename(out_path)} занят другой программой "
+                    "(вероятно, открыт в Excel).",
+                ))
+                self.msg_queue.put((
+                    "log",
+                    f"  Результат сохранён как {os.path.basename(actual_xlsx)}.",
+                ))
 
             elapsed = time.time() - t0
             rows_by_fname = {os.path.basename(p): results[p] for p in pdfs if p in results}
             log_lines = build_log_lines(
                 input_path=input_dir,
-                output_path=out_path,
+                output_path=actual_xlsx,
                 elapsed_s=elapsed,
                 rows_by_file=rows_by_fname,
             )
-            write_log(log_path, log_lines)
+            try:
+                actual_log = write_log_safe(log_path, log_lines)
+            except PermissionError:
+                actual_log = None  # не критично — просто не запишем лог
 
             ok_count = sum(
                 1 for rows in results.values()
@@ -293,8 +317,9 @@ class ParserApp:
                 f"Итого: {total} файлов, {ok_count} OK, {err_count} ошибок, "
                 f"{len(ordered_rows)} строк (за {elapsed:.1f} с)",
             ))
-            self.msg_queue.put(("log", f"Excel: {out_path}"))
-            self.msg_queue.put(("log", f"Лог:   {log_path}"))
+            self.msg_queue.put(("log", f"Excel: {actual_xlsx}"))
+            if actual_log:
+                self.msg_queue.put(("log", f"Лог:   {actual_log}"))
         except Exception as exc:  # noqa: BLE001
             tb = traceback.format_exc(limit=4)
             self.msg_queue.put(("log", f"Критическая ошибка: {exc}\n{tb}"))

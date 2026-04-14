@@ -2,7 +2,9 @@
 """Тесты записи Excel (с колонкой уверенности) и формирования лог-файла."""
 
 from pathlib import Path
+from unittest.mock import patch
 
+import pytest
 from openpyxl import load_workbook
 
 from tn_parser import (
@@ -10,7 +12,9 @@ from tn_parser import (
     ParsedRow,
     build_log_lines,
     write_excel,
+    write_excel_safe,
     write_log,
+    write_log_safe,
 )
 from tn_parser.excel import COLUMNS
 
@@ -76,6 +80,60 @@ class TestExcel:
         low_fill = ws.cell(row=3, column=12).fill.fgColor.rgb
         assert "D9EAD3" in (high_fill or "").upper()
         assert "F4CCCC" in (low_fill or "").upper()
+
+
+class TestLockedFileFallback:
+    """Если основной файл заблокирован (открыт в Excel/блокноте), пишем
+    под именем с меткой времени вместо того, чтобы падать."""
+
+    def test_write_excel_safe_falls_back_on_permission_error(self, tmp_path):
+        rows = list(_sample_rows())
+        out = tmp_path / "locked.xlsx"
+
+        # Первый вызов write_excel из write_excel_safe бросает PermissionError,
+        # второй (на имя с меткой времени) проходит штатно.
+        original = __import__("tn_parser.excel", fromlist=["write_excel"]).write_excel
+        calls = []
+
+        def fake_write_excel(rows, path):
+            calls.append(path)
+            if len(calls) == 1:
+                raise PermissionError(13, "Permission denied", str(path))
+            return original(rows, path)
+
+        with patch("tn_parser.excel.write_excel", side_effect=fake_write_excel):
+            actual = write_excel_safe(rows, str(out))
+
+        # Возвращённый путь не равен исходному, но содержит базу и лежит в той же папке.
+        assert actual != str(out)
+        assert Path(actual).parent == tmp_path
+        assert Path(actual).stem.startswith("locked_")
+        assert Path(actual).exists()
+
+    def test_write_excel_safe_ok_path_when_not_locked(self, tmp_path):
+        rows = list(_sample_rows())
+        out = tmp_path / "ok.xlsx"
+        actual = write_excel_safe(rows, str(out))
+        assert actual == str(out)
+        assert out.exists()
+
+    def test_write_log_safe_falls_back(self, tmp_path):
+        out = tmp_path / "run.log"
+        original = __import__("tn_parser.report", fromlist=["write_log"]).write_log
+        calls = []
+
+        def fake_write_log(path, lines):
+            calls.append(path)
+            if len(calls) == 1:
+                raise PermissionError(13, "Permission denied", str(path))
+            return original(path, lines)
+
+        with patch("tn_parser.report.write_log", side_effect=fake_write_log):
+            actual = write_log_safe(str(out), ["aaa", "bbb"])
+
+        assert actual != str(out)
+        assert Path(actual).exists()
+        assert Path(actual).read_text(encoding="utf-8") == "aaa\nbbb\n"
 
 
 class TestReport:

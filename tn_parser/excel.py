@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import os
+from datetime import datetime
 from typing import List, Tuple
 
 from openpyxl import Workbook
@@ -109,3 +111,25 @@ def write_excel(rows: List[ParsedRow], output_path: str) -> None:
     ws.auto_filter.ref = f"A1:{get_column_letter(last_col)}{max(last_row, 1)}"
 
     wb.save(output_path)
+
+
+def _timestamped(path: str) -> str:
+    """`dir/out.xlsx` → `dir/out_20240414_230015.xlsx`."""
+    base, ext = os.path.splitext(path)
+    return f"{base}_{datetime.now():%Y%m%d_%H%M%S}{ext}"
+
+
+def write_excel_safe(rows: List[ParsedRow], output_path: str) -> str:
+    """Безопасная запись .xlsx: если основной файл заблокирован (обычно
+    открыт в Excel), пишем под соседним именем с меткой времени.
+
+    Возвращает фактический путь, куда удалось записать. Бросает оригинальное
+    исключение, если и запасной вариант не сработал.
+    """
+    try:
+        write_excel(rows, output_path)
+        return output_path
+    except PermissionError:
+        alt = _timestamped(output_path)
+        write_excel(rows, alt)
+        return alt

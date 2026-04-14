@@ -22,8 +22,8 @@ from . import (
     build_log_lines,
     iter_pdfs,
     process_batch,
-    write_excel,
-    write_log,
+    write_excel_safe,
+    write_log_safe,
 )
 
 
@@ -116,16 +116,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     ordered_rows = []
     for p in pdfs:
         ordered_rows.extend(results.get(p, []))
-    write_excel(ordered_rows, output)
+
+    try:
+        actual_xlsx = write_excel_safe(ordered_rows, output)
+    except PermissionError as exc:
+        print(f"Не удалось сохранить Excel: {exc}", file=sys.stderr)
+        print("Закройте файл, если он открыт в Excel, и попробуйте снова.",
+              file=sys.stderr)
+        return 4
+
+    if actual_xlsx != output:
+        print(f"⚠ {output} занят — сохранили как {actual_xlsx}", file=sys.stderr)
 
     rows_by_fname = {os.path.basename(p): results[p] for p in pdfs if p in results}
     log_lines = build_log_lines(
         input_path=input_path,
-        output_path=output,
+        output_path=actual_xlsx,
         elapsed_s=elapsed,
         rows_by_file=rows_by_fname,
     )
-    write_log(log_path, log_lines)
+    try:
+        actual_log = write_log_safe(log_path, log_lines)
+    except PermissionError:
+        actual_log = None
 
     ok = sum(
         1 for rows in results.values()
@@ -136,8 +149,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"Готово: {len(pdfs)} файлов ({ok} OK, {err} ошибок), "
         f"{len(ordered_rows)} строк за {elapsed:.1f} с"
     )
-    print(f"Excel: {output}")
-    print(f"Лог:   {log_path}")
+    print(f"Excel: {actual_xlsx}")
+    if actual_log:
+        print(f"Лог:   {actual_log}")
     return 0 if err == 0 else 3
 
 

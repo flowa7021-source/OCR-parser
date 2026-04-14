@@ -114,3 +114,23 @@ def build_log_lines(
 
 def write_log(path: str, lines: Iterable[str]) -> None:
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_log_safe(path: str, lines: Iterable[str]) -> str:
+    """Аналог write_log с фоллбэком на имя с меткой времени при
+    PermissionError.
+
+    Полезно на Windows, где лог-файл может оказаться открытым в блокноте.
+    """
+    # Iterable может быть генератором — материализуем, чтобы пройтись дважды.
+    lines = list(lines)
+    try:
+        write_log(path, lines)
+        return path
+    except PermissionError:
+        import os
+        from datetime import datetime
+        base, ext = os.path.splitext(path)
+        alt = f"{base}_{datetime.now():%Y%m%d_%H%M%S}{ext}"
+        write_log(alt, lines)
+        return alt
