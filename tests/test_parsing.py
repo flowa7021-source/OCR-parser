@@ -52,10 +52,10 @@ class TestStandardWaybill:
         assert self.row.confidence.overall() >= 0.7
         assert self.row.confidence.vehicle == 1.0
 
-    def test_to_excel_tuple_has_11_columns(self):
-        # 11 колонок: waybill, date, number, shipper, consignee,
-        # cargo, carrier, vehicle, reception, source, note.
-        assert len(self.row.to_excel_tuple()) == 11
+    def test_to_excel_tuple_has_12_columns(self):
+        # 12 колонок: waybill, date, number, shipper, consignee,
+        # cargo, volume, carrier, vehicle, reception, source, note.
+        assert len(self.row.to_excel_tuple()) == 12
 
 
 class TestRealSample7145B:

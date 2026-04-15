@@ -50,6 +50,7 @@ class ParsedRow:
     shipper: str = ""
     consignee: str = ""
     cargo: str = ""
+    volume: str = ""
     carrier: str = ""
     vehicle: str = ""
     reception: str = ""
@@ -65,6 +66,7 @@ class ParsedRow:
             self.shipper,
             self.consignee,
             self.cargo,
+            self.volume,
             self.carrier,
             self.vehicle,
             self.reception,
@@ -81,6 +83,7 @@ class ParsedRow:
             shipper=MISSING,
             consignee=MISSING,
             cargo=MISSING,
+            volume=MISSING,
             carrier=MISSING,
             vehicle=MISSING,
             reception=MISSING,

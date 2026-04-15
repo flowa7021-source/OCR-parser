@@ -62,7 +62,7 @@ class TestCLI:
         # Заголовок + 2 строки (по одной накладной на файл).
         assert ws.max_row >= 3
         # Последняя колонка — confidence.
-        assert ws.cell(row=1, column=12).value == "Уверенность, %"
+        assert ws.cell(row=1, column=13).value == "Уверенность, %"
 
         log_text = log.read_text(encoding="utf-8")
         assert "a.pdf" in log_text

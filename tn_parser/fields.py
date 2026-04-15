@@ -42,13 +42,13 @@ _DATE_ANY = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
 # Номер: не захватываем "Экземпляр №" (подпись у графы экземпляра).
 # N[º°]? убран — голая латинская «N» слишком широкий маркер (матчит «RENAULT» и т.п.).
 _NUMBER_AFTER_SYMBOL = re.compile(
-    r"(?:№|No\.?)\s*[:\-–—]?\s*"
+    r"(?:№|No\.?|N[°º])\s*[:\-–—]?\s*"
     r"([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{0,48})",
     re.IGNORECASE,
 )
 # Запасной: номер вплотную к "№" без пробела («№7145/Б»)
 _NUMBER_STICKY = re.compile(
-    r"(?:№|No\.?)\s*\n?\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{0,48})",
+    r"(?:№|No\.?|N[°º])\s*\n?\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{0,48})",
     re.IGNORECASE,
 )
 
@@ -190,7 +190,7 @@ def extract_number_and_date(
     if source:
         anchor = _WAYBILL_HEADER.search(source)
         if anchor:
-            tail = source[anchor.end(): anchor.end() + 500]
+            tail = source[anchor.end(): anchor.end() + 800]
             number, conf_num = _pick_number(tail, 0.9 if head else 0.6)
             date_m = _DATE_ANY.search(tail)
             if date_m and is_valid_date(date_m.group(1)):
@@ -199,7 +199,7 @@ def extract_number_and_date(
 
     # Резерв: ищем по всему тексту.
     if number == MISSING and full_text:
-        number, c = _pick_number(full_text[:1200], 0.5)
+        number, c = _pick_number(full_text[:2000], 0.5)
         conf_num = c if number != MISSING else 0.0
     if date == MISSING and full_text:
         for m in _DATE_ANY.finditer(full_text):
@@ -306,6 +306,30 @@ def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
                 if candidate and not is_garbage(candidate):
                     return candidate, 0.5
 
+    return MISSING, 0.0
+
+
+_VOLUME_KW = re.compile(r"\b(нетто|брутто|объ[её]м|масс[аы]|вес\b)", re.IGNORECASE)
+_VOLUME_NUM = re.compile(r"\d")
+
+
+def extract_volume(section_body: str, full_text: str) -> Tuple[str, float]:
+    """Извлекает строку с весом/объёмом груза (Нетто/Брутто/Объём)."""
+    if section_body:
+        for ln in section_body.splitlines():
+            s = ln.strip()
+            if _VOLUME_KW.search(s) and _VOLUME_NUM.search(s):
+                if not is_garbage(s):
+                    return s, 0.9
+    if full_text:
+        for m in _VOLUME_KW.finditer(full_text):
+            ls = full_text.rfind("\n", 0, m.start())
+            ls = 0 if ls < 0 else ls + 1
+            le = full_text.find("\n", m.end())
+            le = len(full_text) if le < 0 else le
+            ln = full_text[ls:le].strip()
+            if _VOLUME_NUM.search(ln) and not is_garbage(ln):
+                return ln, 0.5
     return MISSING, 0.0
 
 
@@ -526,6 +550,7 @@ def extract_all(sections: Dict[str, str], full_text: str) -> Dict[str, Tuple[str
         max_lines=3, max_len=300,
     )
     cargo, c_cargo = extract_cargo(sections.get("cargo", ""), full_text)
+    volume, c_volume = extract_volume(sections.get("cargo", ""), full_text)
     vehicle, c_vehicle = extract_vehicle(sections.get("vehicle", ""), full_text)
     reception, c_reception = extract_reception(sections.get("reception", ""), full_text)
 
@@ -535,6 +560,7 @@ def extract_all(sections: Dict[str, str], full_text: str) -> Dict[str, Tuple[str
         "shipper": (shipper, c_shipper),
         "consignee": (consignee, c_consignee),
         "cargo": (cargo, c_cargo),
+        "volume": (volume, c_volume),
         "carrier": (carrier, c_carrier),
         "vehicle": (vehicle, c_vehicle),
         "reception": (reception, c_reception),

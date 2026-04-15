@@ -54,7 +54,7 @@ class TestExcel:
         wb = load_workbook(out)
         ws = wb.active
         headers = [ws.cell(row=1, column=i + 1).value for i in range(len(COLUMNS))]
-        assert len(headers) == 12
+        assert len(headers) == 13
         assert headers[-1] == "Уверенность, %"
 
     def test_confidence_values(self, tmp_path):
@@ -64,10 +64,10 @@ class TestExcel:
 
         wb = load_workbook(out)
         ws = wb.active
-        # Колонка confidence — 12-я.
-        assert ws.cell(row=2, column=12).value == 93  # high ≈ 0.925 → 93%
-        assert ws.cell(row=3, column=12).value == 0   # low
-        assert ws.cell(row=4, column=12).value == 0   # err
+        # Колонка confidence — 13-я.
+        assert ws.cell(row=2, column=13).value == 93  # high ≈ 0.925 → 93%
+        assert ws.cell(row=3, column=13).value == 0   # low
+        assert ws.cell(row=4, column=13).value == 0   # err
 
     def test_confidence_fill_colors(self, tmp_path):
         high, low, _ = _sample_rows()
@@ -76,8 +76,8 @@ class TestExcel:
         wb = load_workbook(out)
         ws = wb.active
         # Высокая уверенность — зелёная; нулевая — красная.
-        high_fill = ws.cell(row=2, column=12).fill.fgColor.rgb
-        low_fill = ws.cell(row=3, column=12).fill.fgColor.rgb
+        high_fill = ws.cell(row=2, column=13).fill.fgColor.rgb
+        low_fill = ws.cell(row=3, column=13).fill.fgColor.rgb
         assert "D9EAD3" in (high_fill or "").upper()
         assert "F4CCCC" in (low_fill or "").upper()
 
