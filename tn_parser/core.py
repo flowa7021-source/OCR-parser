@@ -21,6 +21,7 @@ from .models import GARBAGE, MISSING, FieldConfidence, ParsedRow
 from .normalize import normalize_for_sections
 from .sections import split_sections
 from .splitter import split_documents
+from .claude_fallback import CONFIDENCE_THRESHOLD, claude_enhance
 
 
 LOW_TEXT_THRESHOLD = 200  # символов
@@ -128,6 +129,12 @@ def _build_row(text: str, source: str) -> ParsedRow:
     if row.confidence.overall() < 0.4:
         notes.append("LOW_CONF")
     row.note = ";".join(notes)
+
+    # Если regex-парсер не уверен — пробуем улучшить через Claude API.
+    # claude_enhance — no-op если ANTHROPIC_API_KEY не задан или пакет не установлен.
+    if row.confidence.overall() < CONFIDENCE_THRESHOLD:
+        row = claude_enhance(row, text)
+
     return row
 
 
