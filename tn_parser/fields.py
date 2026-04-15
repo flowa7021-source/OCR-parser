@@ -468,78 +468,27 @@ def _compact_grz_search(region: str) -> Optional[str]:
 
 
 def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
-    """Транспортное средство: марка + ГРЗ в одной ячейке.
+    """Транспортное средство: только канонический ГРЗ.
 
-    Формат вывода — «RENAULT Р 814 НР 152»: сначала марка (если есть),
-    потом канонический ГРЗ. Если марки нет — только ГРЗ.
+    Марку/модель из этого поля намеренно не извлекаем: текстовый слой
+    бланков ТН регулярно «перекрывает» латинские марки кириллицей
+    (например, «RENAULT» → «ВРМАЗЕТ»/«ВЕМАНЛТ»), и в Excel она попадает
+    неразборчивым мусором. Держим в поле только ГРЗ — его формат
+    канонизирован и валидируется.
     """
     if section_body:
         grz = _compact_grz_search(section_body)
+        if grz:
+            return format_grz(grz), 1.0
 
-        # Строки без служебки и без "(тип, марка …)"-подсказок.
+        # ГРЗ не нашли, но раздел есть — отдаём первую содержательную строку.
         lines = _meaningful_lines(section_body)
 
-        # Фильтруем подсказки-пометки вроде «(тип, марка, грузоподъемность…)».
         def _is_hint(ln: str) -> bool:
             low = ln.lower()
             return bool(re.match(r"^\((тип|марка|модель|регистрационн|рег\.?)", low))
 
         lines = [ln for ln in lines if not _is_hint(ln)]
-
-        # Разделяем строки с меткой «Марка:», «Модель:» и без.
-        marka_parts: List[str] = []
-        for ln in lines:
-            low = ln.lower()
-            if low.startswith(("марка", "модель", "тип", "т/с")):
-                parts = re.split(r"[:\-–—]", ln, maxsplit=1)
-                if len(parts) == 2 and parts[1].strip():
-                    marka_parts.append(parts[1].strip())
-                continue
-            # Строка, в которой есть ГРЗ.
-            if grz:
-                compact_ln = re.sub(
-                    r"(?<=[А-ЯЁA-Z0-9])\s+(?=[А-ЯЁA-Z0-9])", "", ln.upper()
-                )
-                m_grz = GRZ_CANDIDATE.search(compact_ln)
-                if m_grz:
-                    # Если найденный кандидат совпадает с нашим ГРЗ — эта строка
-                    # содержит ГРЗ. Пробуем вытащить марку из префикса до ГРЗ.
-                    if m_grz.start() > 0:
-                        # Считаем непробельные символы в оригинальной строке:
-                        # ищем позицию, где их накопилось m_grz.start() штук.
-                        ns = 0
-                        end_pos = len(ln)
-                        for ci, ch in enumerate(ln):
-                            if not ch.isspace():
-                                if ns == m_grz.start():
-                                    end_pos = ci
-                                    break
-                                ns += 1
-                        brand_raw = ln[:end_pos].strip(" ,;()")
-                        if brand_raw and len(brand_raw) >= 2:
-                            marka_parts.append(brand_raw)
-                    continue
-            # Строки с инн/кпп — точно не ТС.
-            if re.search(r"\b(инн|кпп|огрн|окпо)\b", low):
-                continue
-            # Похоже на название марки (буквы/цифры, короткая).
-            if 2 <= len(ln) <= 60:
-                marka_parts.append(ln)
-
-        if grz:
-            pretty = format_grz(grz)
-            if marka_parts:
-                # Берём ПЕРВУЮ содержательную часть (обычно марка в верхней строке).
-                marka = marka_parts[0].strip(" ,;")
-                # Снимаем OCR-мусор по краям: «_ ВРМАЗЕТ» → «ВРМАЗЕТ»,
-                # «/ RENAULT /» → «RENAULT». Оставляем буквы/цифры/точки/дефисы.
-                marka = re.sub(r"^[^A-Za-zА-Яа-яЁё0-9]+", "", marka)
-                marka = re.sub(r"[^A-Za-zА-Яа-яЁё0-9.\-]+$", "", marka)
-                if marka:
-                    return f"{marka} {pretty}", 1.0
-            return pretty, 1.0
-
-        # ГРЗ не нашли, но раздел есть — отдаём первую содержательную строку.
         if lines:
             return lines[0][:80], 0.5
 
@@ -627,6 +576,101 @@ def _looks_noisy(line: str) -> bool:
     return False
 
 
+# --- Классификация строк в «Приёме груза» ---------------------------------
+
+# Индекс + область/респ/край — «141411, обл. Московская, с/п …».
+_ADDRESS_POSTCODE = re.compile(r"^\s*\d{6}\b")
+# Строки, начинающиеся с сокращённых топонимов — «д. Подолино», «г. Москва».
+_ADDRESS_TOPONYM = re.compile(
+    r"^\s*(?:д\.|г\.|с\.|пос\.|п\.|обл\.|с/п|с-п|р-н|ул\.|пр\.|пр-т|пер\.|ш\.)",
+    re.IGNORECASE,
+)
+# Реквизиты юрлица/ИП: ООО, АО, ЗАО, ПАО, ИП и т.п.
+_ORG_PREFIX = re.compile(
+    r"^\s*(?:ООО|ОАО|АО|ЗАО|ПАО|ПБОЮЛ|ИП)\b", re.IGNORECASE
+)
+_DATE_ONLY = re.compile(r"^\s*\d{2}\.\d{2}\.\d{4}\s*$")
+
+
+def _line_kind(line: str) -> str:
+    """Тип строки для «Приёма груза»: org | address | date | other."""
+    s = line.strip()
+    if _DATE_ONLY.match(s):
+        return "date"
+    if _ORG_PREFIX.match(s):
+        return "org"
+    if _ADDRESS_POSTCODE.match(s) or _ADDRESS_TOPONYM.match(s):
+        return "address"
+    return "other"
+
+
+def _merge_address_fragments(lines: List[str]) -> List[str]:
+    """Склеивает фрагменты одного адреса в одну строку.
+
+    Для двухколоночного OCR типичен порядок: сначала топоним («д. Подолино»),
+    потом основная часть с индексом («141411, обл. Московская, с/п …»).
+    Мы переставляем их местами и склеиваем через запятую.
+    """
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        cur = lines[i].strip()
+        cur_kind = _line_kind(cur)
+
+        # «д. Подолино» в одиночку → ждём следующей строки-адреса с индексом.
+        if (cur_kind == "address"
+                and _ADDRESS_TOPONYM.match(cur)
+                and not _ADDRESS_POSTCODE.match(cur)
+                and i + 1 < len(lines)):
+            nxt = lines[i + 1].strip().rstrip(",; ")
+            if _ADDRESS_POSTCODE.match(nxt):
+                out.append(f"{nxt}, {cur}".rstrip(",; "))
+                i += 2
+                continue
+
+        # «141411, …, с/п …, р-н …,» без населённого пункта, а следующая
+        # строка — топоним «д. …»: обычный прямой порядок.
+        if (cur_kind == "address"
+                and _ADDRESS_POSTCODE.match(cur)
+                and i + 1 < len(lines)):
+            nxt = lines[i + 1].strip()
+            if _ADDRESS_TOPONYM.match(nxt) and not _ADDRESS_POSTCODE.match(nxt):
+                cur_clean = cur.rstrip(",; ")
+                out.append(f"{cur_clean}, {nxt}".rstrip(",; "))
+                i += 2
+                continue
+
+        out.append(cur)
+        i += 1
+    return out
+
+
+def _split_into_blocks(lines: List[str]) -> List[str]:
+    """Формирует блоки «реквизиты — адрес — дата» для сборки через пустую строку.
+
+    Каждый блок — это одна уже самодостаточная строка (или несколько однотипных
+    строк, если они идут подряд). Между блоками в итоговой сборке вставляется
+    пустая строка, чтобы пользователь в Excel видел адреса отдельно друг от
+    друга, а не «в кучу».
+    """
+    blocks: List[str] = []
+    prev_kind: Optional[str] = None
+    buf: List[str] = []
+    for ln in lines[:12]:
+        kind = _line_kind(ln)
+        # Склеиваем подряд идущие строки одного типа (на случай нескольких
+        # адресов подряд).
+        if prev_kind is not None and kind != prev_kind:
+            if buf:
+                blocks.append("\n".join(buf))
+                buf = []
+        buf.append(ln)
+        prev_kind = kind
+    if buf:
+        blocks.append("\n".join(buf))
+    return blocks
+
+
 def extract_reception(section_body: str, full_text: str) -> Tuple[str, float]:
     """Приём груза с агрессивной чисткой OCR-шума."""
     if section_body:
@@ -708,8 +752,20 @@ def extract_reception(section_body: str, full_text: str) -> Tuple[str, float]:
             deduped.append(ln)
         lines = deduped
 
+        # Мелкая косметика: «Ин» на хвосте → «ИНН» (OCR часто режет 3-ю букву).
+        lines = [re.sub(r"\bИн\s+(?=\d)", "ИНН ", ln) for ln in lines]
+
+        # Группируем строки в логические блоки: (1) реквизиты контрагента,
+        # (2) адрес места погрузки, (3) дата. Это делается двумя вещами:
+        # — склейка фрагментов адреса («141411, обл. Московская, с/п …» +
+        #   «д. Подолино»), которые OCR разрывает на две строки из-за
+        #   двухколоночного макета;
+        # — вставка пустой строки между блоками, чтобы в Excel/логе поле не
+        #   читалось «в кучу».
         if lines:
-            body_clean = "\n".join(lines[:12])[:1200].strip()
+            lines = _merge_address_fragments(lines)
+            blocks = _split_into_blocks(lines)
+            body_clean = "\n\n".join(blocks)[:1500].strip()
             if body_clean and not is_garbage(body_clean):
                 return body_clean, 0.9
 

@@ -159,10 +159,12 @@ class TestOcrTabularLayout:
         # Служебные «(реквизиты, позволяющие…)» не попадают.
         assert "(реквизиты" not in self.row.carrier
 
-    def test_vehicle_combines_marka_and_grz(self):
-        # Формат: «RENAULT Р 814 НР 152».
-        assert "RENAULT" in self.row.vehicle
+    def test_vehicle_is_grz_only(self):
+        # Марку из поля «Транспортное средство» не извлекаем (OCR бланков
+        # систематически «перекрывает» латиницу кириллицей, делая марку
+        # неразборчивой). Храним только канонический ГРЗ.
         assert "Р 814 НР 152" in self.row.vehicle
+        assert "RENAULT" not in self.row.vehicle
 
     def test_reception_no_next_section_leak(self):
         r = self.row.reception
@@ -265,8 +267,9 @@ class TestOcrNoise:
     def test_vehicle_has_real_grz(self):
         assert "Р 814 НР 152" in self.row.vehicle
 
-    def test_vehicle_has_brand(self):
-        assert "RENAULT" in self.row.vehicle
+    def test_vehicle_has_no_brand(self):
+        # Марка не извлекается — её OCR ненадёжен. В поле остаётся только ГРЗ.
+        assert "RENAULT" not in self.row.vehicle
 
     # --- Проблема 3: шум в грузоотправителе/приёме -----------------------
 
@@ -332,9 +335,9 @@ class TestOcrInlineLayout:
     def test_date_extracted(self):
         assert self.row.date == "23.07.2022"
 
-    def test_vehicle_brand_extracted_from_inline_line(self):
-        # «RENAULT Р 814 НР 152» — марка и ГРЗ в одной строке.
-        assert "RENAULT" in self.row.vehicle
+    def test_vehicle_brand_dropped_inline_layout(self):
+        # «RENAULT Р 814 НР 152» — марка в поле не попадает, остаётся только ГРЗ.
+        assert "RENAULT" not in self.row.vehicle
 
     def test_vehicle_grz_extracted_from_inline_line(self):
         assert "Р 814 НР 152" in self.row.vehicle
@@ -502,15 +505,13 @@ class TestRealOcrV2:
         assert "Самовывоз" not in c
         assert "реквизиты" not in c.lower()
 
-    def test_vehicle_has_brand_and_grz_clean(self):
+    def test_vehicle_only_grz_no_brand(self):
         v = self.row.vehicle
-        # ГРЗ в каноническом виде присутствует.
-        assert "Р 814 НР 152" in v
-        # Марка (после OCR) — «ВРМАЗЕТ»; OCR-мусорные префиксы «_ », «/ »
-        # должны быть срезаны.
-        assert "ВРМАЗЕТ" in v
-        assert not v.startswith("_")
-        assert not v.startswith("/")
+        # Держим в поле только ГРЗ. «ВРМАЗЕТ» — это OCR-перекладка латинского
+        # «RENAULT» кириллицей; в итоговую строку не попадает.
+        assert v == "Р 814 НР 152"
+        assert "ВРМАЗЕТ" not in v
+        assert "RENAULT" not in v
 
     def test_reception_is_clean(self):
         r = self.row.reception
@@ -530,6 +531,27 @@ class TestRealOcrV2:
         # Нет следующего раздела «Переадресовка/Выдача».
         assert "Переадресовка" not in r
         assert "Выдача" not in r
+
+    def test_reception_blocks_separated_by_blank_line(self):
+        r = self.row.reception
+        # Блоки «реквизиты | адрес | дата» разделены пустой строкой.
+        blocks = [b.strip() for b in r.split("\n\n") if b.strip()]
+        assert len(blocks) >= 3
+        # Компания — в первом блоке.
+        assert "Бекам" in blocks[0]
+        # Адрес погрузки — в отдельном блоке, склеен в одну строку
+        # (индекс + область/с-п/р-н + населённый пункт), без «куча в кучу».
+        address_block = next(b for b in blocks if "Подолино" in b)
+        assert "141411" in address_block
+        assert "Московская" in address_block
+        assert "\n" not in address_block  # одна строка, а не каша
+        # Дата — отдельным блоком.
+        assert any(b.strip() == "23.07.2022" for b in blocks)
+
+    def test_reception_has_innn_not_trimmed(self):
+        # «Ин 7743553262» → «ИНН 7743553262» (восстанавливаем 3-ю букву,
+        # часто теряемую OCR на границе ячейки).
+        assert "ИНН 7743553262" in self.row.reception
 
 
 # ---------------------------------------------------------------------------
