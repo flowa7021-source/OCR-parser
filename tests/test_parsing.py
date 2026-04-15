@@ -655,6 +655,98 @@ class TestRealOcrV3:
             assert junk not in r, f"template junk {junk!r} leaked into reception"
 
 
+class TestForm1T:
+    """«Типовая межотраслевая форма № 1-Т» (пост. Госкомстата №78 от 28.11.97).
+
+    Старая форма ТТН, до сих пор встречается — особенно при перевозке
+    алкогольной и с/х продукции. Отличия от современной ТН:
+      — Название заголовков другое: «Организация-владелец автотранспорта»,
+        «Пункт погрузки/разгрузки», «Товарный раздел»/«Сведения о грузе».
+      — Форма двухсекционная («Товарный» + «Транспортный разделы»), ФИО
+        водителя оформлено как отдельное поле «Водитель:».
+      — Табличный груз с колонками «Наименование товара / Ед.изм / Кол-во /
+        Цена / Сумма».
+    """
+
+    def setup_method(self) -> None:
+        rows = parse_text(_text("tn_form_1t.txt"), "tn_form_1t.pdf")
+        assert len(rows) == 1
+        self.row = rows[0]
+
+    def test_number(self):
+        assert self.row.number == "2908-23А"
+
+    def test_date(self):
+        assert self.row.date == "29.08.2022"
+
+    def test_shipper_from_inline_header(self):
+        # «Грузоотправитель  ООО "ТЕПЛОСТРОЙ", ...» — ярлык и значение
+        # на одной строке через пробелы (без двоеточия). Парсер должен
+        # откусить ярлык и взять остаток как inline-значение.
+        s = self.row.shipper
+        assert "ТЕПЛОСТРОЙ" in s
+        assert "7728123456" in s
+        assert "Санкт-Петербург" in s
+        # Сам ярлык в значение не попадает.
+        assert not s.lower().startswith("грузоотправитель")
+
+    def test_consignee_from_inline_header(self):
+        c = self.row.consignee
+        assert "СТРОЙИМПЕКС" in c
+        assert "7707890123" in c
+        assert not c.lower().startswith("грузополучатель")
+
+    def test_cargo_table_no_header_row(self):
+        # Заголовок табличного блока «№ Наименование товара Ед.изм Кол-во
+        # Цена Сумма» — шаблон, не данные, и в значение НЕ попадает.
+        c = self.row.cargo
+        assert "Наименование товара" not in c
+        assert "Ед.изм" not in c
+        # Зато все 3 позиции груза сохранены отдельными строками.
+        assert "Кирпич" in c
+        assert "Цемент" in c
+        assert "Песок" in c
+        lines = [ln for ln in c.split("\n") if re.match(r"^\s*\d+[.)]\s", ln)]
+        assert len(lines) == 3
+
+    def test_carrier_is_driver_from_label(self):
+        # У формы 1-Т «Водитель» — отдельная строка-подпись, может стоять
+        # даже в другом разделе. Парсер должен вытащить ФИО по ярлыку.
+        assert self.row.carrier == "Петров Иван Сергеевич"
+        assert "АВТО-ТРАНС" not in self.row.carrier
+        assert "7811223344" not in self.row.carrier
+
+    def test_vehicle_only_grz(self):
+        # ГРЗ указан в «Государственный номерной знак: А 123 ВВ 178».
+        assert self.row.vehicle == "А 123 ВВ 178"
+        # Марка намеренно не берётся (см. _vehicle_only_grz во всех формах).
+        assert "КАМАЗ" not in self.row.vehicle
+
+    def test_reception_has_pickup_point(self):
+        # «Пункт погрузки» — отдельный раздел в 1-Т, мапится на reception.
+        r = self.row.reception
+        assert "Санкт-Петербург" in r
+        assert "склад" in r.lower()
+        # «Пункт разгрузки» — __ignored__, в reception не утекает.
+        assert "разгрузки" not in r.lower()
+        assert "Строителей" not in r
+
+    def test_no_ignored_sections_leaking_into_data(self):
+        # Специфические разделы 1-Т («Плательщик», «Таксировка») —
+        # служебные, не должны попадать в извлечённые поля.
+        blob = " ".join([
+            self.row.shipper, self.row.consignee, self.row.cargo,
+            self.row.carrier, self.row.vehicle, self.row.reception,
+        ])
+        assert "Таксировка" not in blob
+        assert "Плательщик" not in blob
+
+    def test_confidence_reasonable(self):
+        # Даже на «чужой» форме общая уверенность должна быть ≥ 0.7,
+        # иначе Claude-fallback сработает лишний раз.
+        assert self.row.confidence.overall() >= 0.7
+
+
 # ---------------------------------------------------------------------------
 
 
