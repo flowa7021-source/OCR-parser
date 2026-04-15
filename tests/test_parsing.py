@@ -150,10 +150,12 @@ class TestOcrTabularLayout:
         assert self.row.cargo.startswith("Блок облицовочный")
         assert "Наименование" not in self.row.cargo
 
-    def test_carrier_combines_two_columns(self):
-        # Две колонки: «Самовывоз» + «Рябов В.К.».
-        assert "Самовывоз" in self.row.carrier
+    def test_carrier_is_driver_when_samovyvoz_standalone(self):
+        # При самовывозе «перевозчик» по сути — водитель. Если «Самовывоз»
+        # стоит на отдельной строке, а ФИО водителя — на следующей, в
+        # карточке перевозчика оставляем только ФИО (юрлица-перевозчика нет).
         assert "Рябов" in self.row.carrier
+        assert "Самовывоз" not in self.row.carrier
         # Служебные «(реквизиты, позволяющие…)» не попадают.
         assert "(реквизиты" not in self.row.carrier
 
@@ -434,6 +436,100 @@ class TestRealOcrFormat:
         assert "(заявленные дата" not in r
         assert "Подолино" in r
         assert "23.07.2022" in r
+
+
+class TestRealOcrV2:
+    """Полный «сырой» дамп PyMuPDF реальной ТН №7145/Б с двухколоночной формой.
+
+    Сценарии, сложившиеся в одной фикстуре:
+    - Шаблонные хвосты в грузоотправителе («отличным от грузоотправителя…»).
+    - «Доугая нсобходимая информация о грузе)» и {-шаблоны в груз.
+    - «7. Транспортное средств6 ‚^» — OCR-типос в заголовке ТС.
+    - «_ ВРМАЗЕТ / Р 814 НР 152» — марка + ГРЗ через OCR-мусор.
+    - Самовывоз + водитель на разных строках → в перевозчике только водитель.
+    - «Нетто —\\n20,52 т., Брутто —\\n…» — объём, склеиваемый через тире.
+    - В «Приём груза» два прочтения ООО «Бекам» и хвост шаблона формы.
+    """
+
+    def setup_method(self) -> None:
+        rows = parse_text(_text("tn_real_ocr_v2.txt"), "tn_real_ocr_v2.pdf")
+        assert len(rows) == 1
+        self.row = rows[0]
+
+    def test_number_from_table_cell(self):
+        # В сыром тексте заголовок прочитан как «№7145/6», но табличная
+        # ячейка «№ — |7145/Б» даёт правильный номер с кириллической «Б».
+        assert self.row.number == "7145/Б"
+
+    def test_date(self):
+        assert self.row.date == "23.07.2022"
+
+    def test_shipper_no_service_tail(self):
+        # «отличным от грузоотправителя (при наличии)» — шаблонная метка,
+        # не значение; не должна попасть в реквизиты грузоотправителя.
+        s = self.row.shipper
+        assert "Бекам" in s
+        assert "7743553262" in s
+        assert "отличным" not in s.lower()
+        assert "(при наличи" not in s.lower()
+
+    def test_cargo_clean(self):
+        # «Блок облицовочный…720 нтт» — без шаблонных приложений формы.
+        c = self.row.cargo
+        assert c.startswith("Блок облицовочный")
+        assert "Наименование" not in c
+        assert "необходим" not in c.lower()
+        assert "масса груза" not in c.lower()
+        assert "ДОПОГ" not in c
+        assert "при необходимости" not in c.lower()
+        # И никакого «{» / «[» шаблонного пролога.
+        assert "{" not in c
+        assert "[" not in c
+
+    def test_volume_has_all_three_values(self):
+        v = self.row.volume
+        assert "20,52" in v
+        assert "20,835" in v
+        assert "8,73" in v
+        # Висячего тире в конце быть не должно.
+        assert not v.rstrip().endswith("—")
+        assert not v.rstrip().endswith("-")
+
+    def test_carrier_only_driver(self):
+        # Самовывоз + отдельная строка с ФИО → только ФИО.
+        c = self.row.carrier
+        assert c == "Рябов В.К." or c.startswith("Рябов В.К.")
+        assert "Самовывоз" not in c
+        assert "реквизиты" not in c.lower()
+
+    def test_vehicle_has_brand_and_grz_clean(self):
+        v = self.row.vehicle
+        # ГРЗ в каноническом виде присутствует.
+        assert "Р 814 НР 152" in v
+        # Марка (после OCR) — «ВРМАЗЕТ»; OCR-мусорные префиксы «_ », «/ »
+        # должны быть срезаны.
+        assert "ВРМАЗЕТ" in v
+        assert not v.startswith("_")
+        assert not v.startswith("/")
+
+    def test_reception_is_clean(self):
+        r = self.row.reception
+        # Есть основная шапка, адрес погрузки и дата.
+        assert "Бекам" in r
+        assert "Подолино" in r
+        assert "23.07.2022" in r
+        # Повторы блока «ООО Бекам» убраны — «Бекам» встречается один раз.
+        assert r.lower().count("бекам") == 1
+        # Хвост шаблона формы не попал в значение.
+        assert "масса груза брутто" not in r.lower()
+        assert "взвеш" not in r.lower()
+        assert "расчетная масс" not in r.lower()
+        # Нет висячего «Нетто —» / «Брутто —» (данные выводятся в volume).
+        assert "Нетто" not in r
+        assert "Брутто" not in r
+        # Нет следующего раздела «Переадресовка/Выдача».
+        assert "Переадресовка" not in r
+        assert "Выдача" not in r
 
 
 # ---------------------------------------------------------------------------
