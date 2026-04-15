@@ -287,6 +287,18 @@ class TestOcrNoise:
         for ch in "іїєґ":
             assert ch not in r, f"ukrainian letter {ch!r} leaked into reception"
 
+    def test_cargo_strips_ocr_naim_prefix(self):
+        # «1. Нанменование — Блок облицовочный» — OCR-вариант «Наименование».
+        # Префикс должен быть выпилен, значение начинается с «Блок».
+        assert "Блок облицовочный" in self.row.cargo
+        assert "Нанменование" not in self.row.cargo
+        assert "наименование" not in self.row.cargo.lower()
+
+    def test_carrier_no_short_noise(self):
+        # «/ Й /» — OCR-мусор из границы ячейки таблицы, не должен попасть.
+        assert "/ Й /" not in self.row.carrier
+        assert "Самовывоз" in self.row.carrier
+
 
 class TestOcrInlineLayout:
     """Заголовок ТН: всё в одной строке.
