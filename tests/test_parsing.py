@@ -408,6 +408,10 @@ class TestRealOcrFormat:
         # «1. Нанменование —» (строка без значения) должна быть отброшена.
         assert "Блок облицовочный" in self.row.cargo
         assert "Нанменование" not in self.row.cargo
+        # Весовые/объёмные данные не должны попадать в наименование груза.
+        assert "Брутто" not in self.row.cargo
+        assert "Объем" not in self.row.cargo
+        assert "20,52" not in self.row.cargo
 
     def test_volume_joins_split_lines(self):
         # «Нетто —\n20,52 т., Брутто —\n20,835 т., Объем —\n8,73 м³»
