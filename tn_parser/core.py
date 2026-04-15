@@ -31,18 +31,48 @@ CACHE_VERSION = 10  # ↑ при изменении логики парсинг�
 # ---------------------------------------------------------------------------
 # Кэш
 # ---------------------------------------------------------------------------
+# Каждая версия парсера пишет в собственный подкаталог «v<N>».
+# Старые подкаталоги («v8», «v9» и т.д.) удаляются автоматически при запуске.
+# Это гарантирует, что старый .exe никогда не прочтёт кэш, записанный новым.
+# ---------------------------------------------------------------------------
+
+_CACHE_BASE = os.path.join(tempfile.gettempdir(), "transport_parser_cache")
 
 
 def _cache_dir() -> str:
-    path = os.path.join(tempfile.gettempdir(), "transport_parser_cache")
+    """Возвращает каталог кэша для *текущей* версии, создаёт при необходимости."""
+    path = os.path.join(_CACHE_BASE, f"v{CACHE_VERSION}")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _cleanup_old_cache_dirs() -> None:
+    """Удаляет каталоги кэша от предыдущих версий."""
+    try:
+        if not os.path.isdir(_CACHE_BASE):
+            return
+        current = f"v{CACHE_VERSION}"
+        for entry in os.listdir(_CACHE_BASE):
+            if entry != current and entry.startswith("v"):
+                stale = os.path.join(_CACHE_BASE, entry)
+                try:
+                    for f in os.listdir(stale):
+                        os.remove(os.path.join(stale, f))
+                    os.rmdir(stale)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+# Выполняем очистку один раз при импорте модуля.
+_cleanup_old_cache_dirs()
 
 
 def _file_signature(pdf_path: str) -> str:
     try:
         st = os.stat(pdf_path)
-        raw = f"{os.path.abspath(pdf_path)}|{st.st_size}|{int(st.st_mtime)}|v{CACHE_VERSION}"
+        raw = f"{os.path.abspath(pdf_path)}|{st.st_size}|{int(st.st_mtime)}"
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
     except OSError:
         return ""
@@ -56,10 +86,13 @@ def _cache_get(pdf_path: str) -> Optional[List[ParsedRow]]:
     try:
         with open(cache_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        if isinstance(data, dict):
-            # Обратная совместимость с предыдущей версией кэша (одна строка).
-            data = [data]
-        return [ParsedRow.from_json_dict(d) for d in data]
+        # Двойная проверка: версия должна совпадать (защита от редких коллизий).
+        if isinstance(data, dict) and data.get("_cv") == CACHE_VERSION:
+            rows_data = data.get("rows", [])
+        else:
+            # Устаревший формат или чужая версия — не использовать.
+            return None
+        return [ParsedRow.from_json_dict(d) for d in rows_data]
     except (OSError, ValueError, TypeError, KeyError):
         return None
 
@@ -71,7 +104,11 @@ def _cache_put(pdf_path: str, rows: List[ParsedRow]) -> None:
     cache_path = os.path.join(_cache_dir(), sig + ".json")
     try:
         with open(cache_path, "w", encoding="utf-8") as fh:
-            json.dump([r.to_json_dict() for r in rows], fh, ensure_ascii=False)
+            json.dump(
+                {"_cv": CACHE_VERSION, "rows": [r.to_json_dict() for r in rows]},
+                fh,
+                ensure_ascii=False,
+            )
     except OSError:
         pass
 
