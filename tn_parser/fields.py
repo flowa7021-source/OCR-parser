@@ -28,6 +28,7 @@ from .normalize import (
     strip_garbage_tokens,
 )
 from .validators import (
+    GRZ_CANDIDATE,
     find_grz,
     format_grz,
     is_valid_date,
@@ -39,9 +40,9 @@ from .models import MISSING, GARBAGE
 _DATE_ANY = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
 
 # Номер: не захватываем "Экземпляр №" (подпись у графы экземпляра).
+# N[º°]? убран — голая латинская «N» слишком широкий маркер (матчит «RENAULT» и т.п.).
 _NUMBER_AFTER_SYMBOL = re.compile(
-    r"(?<!экземпляр\s)(?<!экз\s)"  # предшествующие слова исключаем
-    r"(?:№|No\.?|N[º°]?)\s*[:\-–—]?\s*"
+    r"(?:№|No\.?)\s*[:\-–—]?\s*"
     r"([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{0,48})",
     re.IGNORECASE,
 )
@@ -151,14 +152,19 @@ def extract_number_and_date(
         # Собираем все кандидаты и выбираем первый непустой/осмысленный.
         for rx in (_NUMBER_STICKY, _NUMBER_AFTER_SYMBOL):
             for m in rx.finditer(region):
-                # Проверяем, не «Экземпляр №» ли это: смотрим только в
-                # пределах ТЕКУЩЕЙ строки (до \n), а не 20 символов назад.
-                # Это исключает ложное срабатывание когда «Экземпляр №»
-                # стоит на строке ВЫШЕ реального «№ 7145/Б».
+                # Проверяем, не «Экземпляр №» ли это.
+                # Стратегия: смотрим на ближайшие 20 символов слева, но НЕ
+                # пересекаем границу строки. Это обрабатывает два случая:
+                #   а) «Экземпляр №\n№ 7145/Б» — переносы между строками:
+                #      second № не видит «экземпляр» из предыдущей строки.
+                #   б) «Экземпляр №  Дата 23.07.2022  № 7145/Б» — одна строка:
+                #      second № смотрит лишь 20 симв. назад → «23.07.2022  »,
+                #      «экземпляр» не попадает в окно.
                 line_start = region.rfind("\n", 0, m.start())
                 line_start = 0 if line_start < 0 else line_start + 1
-                same_line_ctx = region[line_start: m.start()].lower()
-                if "экземпляр" in same_line_ctx or "экз." in same_line_ctx:
+                near_start = max(line_start, m.start() - 20)
+                near_ctx = region[near_start: m.start()].lower()
+                if "экземпляр" in near_ctx or "экз." in near_ctx:
                     continue
                 candidate = m.group(1).strip(" .,:;")
                 if not candidate:
@@ -333,9 +339,30 @@ def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
                 if len(parts) == 2 and parts[1].strip():
                     marka_parts.append(parts[1].strip())
                 continue
-            # Строка, в которой есть ГРЗ — игнорируем.
-            if grz and grz in re.sub(r"\s+", "", ln.upper()):
-                continue
+            # Строка, в которой есть ГРЗ.
+            if grz:
+                compact_ln = re.sub(
+                    r"(?<=[А-ЯЁA-Z0-9])\s+(?=[А-ЯЁA-Z0-9])", "", ln.upper()
+                )
+                m_grz = GRZ_CANDIDATE.search(compact_ln)
+                if m_grz:
+                    # Если найденный кандидат совпадает с нашим ГРЗ — эта строка
+                    # содержит ГРЗ. Пробуем вытащить марку из префикса до ГРЗ.
+                    if m_grz.start() > 0:
+                        # Считаем непробельные символы в оригинальной строке:
+                        # ищем позицию, где их накопилось m_grz.start() штук.
+                        ns = 0
+                        end_pos = len(ln)
+                        for ci, ch in enumerate(ln):
+                            if not ch.isspace():
+                                if ns == m_grz.start():
+                                    end_pos = ci
+                                    break
+                                ns += 1
+                        brand_raw = ln[:end_pos].strip(" ,;()")
+                        if brand_raw and len(brand_raw) >= 2:
+                            marka_parts.append(brand_raw)
+                    continue
             # Строки с инн/кпп — точно не ТС.
             if re.search(r"\b(инн|кпп|огрн|окпо)\b", low):
                 continue

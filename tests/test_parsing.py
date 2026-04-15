@@ -287,6 +287,48 @@ class TestOcrNoise:
         for ch in "іїєґ":
             assert ch not in r, f"ukrainian letter {ch!r} leaked into reception"
 
+
+class TestOcrInlineLayout:
+    """Заголовок ТН: всё в одной строке.
+
+    Реальный OCR двухколоночных форм иногда помещает заголовок, «Экземпляр №»,
+    «Дата» и «№ номер» на ОДНУ строку (левая и правая колонки читаются слева
+    направо подряд). Это порождает два системных бага:
+
+    1. Номер: «Экземпляр №» стоит ЛЕВЕЕ реального «№ 7145/Б» на той же строке
+       → старая логика включала «экземпляр» в same-line контекст для ОБОИХ «№»
+       и пропускала правильный номер.
+
+    2. ТС: когда марка и ГРЗ на одной строке («RENAULT Р 814 НР 152»), строка
+       полностью пропускалась и марка не извлекалась.
+    """
+
+    def setup_method(self) -> None:
+        rows = parse_text(_text("tn_ocr_inline.txt"), "tn_ocr_inline.pdf")
+        assert len(rows) == 1
+        self.row = rows[0]
+
+    def test_number_extracted_despite_ekzemplyar_same_line(self):
+        # «Экземпляр №» стоит левее настоящего «№ 7145/Б» на той же строке.
+        assert self.row.number == "7145/Б"
+
+    def test_date_extracted(self):
+        assert self.row.date == "23.07.2022"
+
+    def test_vehicle_brand_extracted_from_inline_line(self):
+        # «RENAULT Р 814 НР 152» — марка и ГРЗ в одной строке.
+        assert "RENAULT" in self.row.vehicle
+
+    def test_vehicle_grz_extracted_from_inline_line(self):
+        assert "Р 814 НР 152" in self.row.vehicle
+
+    def test_shipper_ok(self):
+        assert "Бекам" in self.row.shipper
+        assert "7743553262" in self.row.shipper
+
+    def test_consignee_ok(self):
+        assert "Моспроект" in self.row.consignee
+
     def test_reception_no_embedded_quotes(self):
         # «Бекам'тбд», «'Г'чп» — апострофы внутри слов должны быть выпилены.
         r = self.row.reception
