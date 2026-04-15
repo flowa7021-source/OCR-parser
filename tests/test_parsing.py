@@ -367,3 +367,66 @@ class TestOcrInlineLayout:
         s = self.row.shipper.lower()
         assert "(при наличи" not in s
         assert "перевозки груза" not in s
+
+
+class TestRealOcrFormat:
+    """Реальный формат OCR: табличная разбивка строк из двухколоночного PDF.
+
+    Паттерны, которых нет в других фикстурах:
+    1. Номер в ячейке «№ — |7145/Б» (с pipe-сепаратором); заголовок ТН при
+       этом OCR-читается как «№7145/6» (6 вместо Б).
+    2. Аннотация грузоотправителя разбита: «Заказчик услуг по организации» на
+       одной строке, «перевозки груза (при наличии)» — на следующей.
+    3. Наименование груза на отдельной строке: «1. Нанменование —» без значения,
+       «Блок облицовочный...» — на следующей.
+    4. Объём разбит через тире: «Нетто —\n20,52 т., Брутто —\n20,835 т.,...»
+    5. Перевозчик: «— (реквизиты, позволяющие идентифицировать водителя(-ей))»
+       должен фильтроваться.
+    6. Приём груза: аннотации «(адрес места погрузки)» и подобные — фильтруются.
+    """
+
+    def setup_method(self) -> None:
+        rows = parse_text(_text("tn_real_ocr.txt"), "tn_real_ocr.pdf")
+        assert len(rows) == 1
+        self.row = rows[0]
+
+    def test_number_from_pipe_table_cell(self):
+        # «№ — |7145/Б» — pipe-сепаратор не должен мешать.
+        # Заголовок «НАКЛАДНАЯ №7145/6» (OCR-ошибка) не должен перебить.
+        assert self.row.number == "7145/Б"
+
+    def test_date(self):
+        assert self.row.date == "23.07.2022"
+
+    def test_shipper_no_multiline_service_annotation(self):
+        # «перевозки груза (при наличии)» на отдельной строке — не значение.
+        assert "перевозки груза" not in self.row.shipper.lower()
+        assert "Бекам" in self.row.shipper
+        assert "7743553262" in self.row.shipper
+
+    def test_cargo_strips_standalone_prefix_line(self):
+        # «1. Нанменование —» (строка без значения) должна быть отброшена.
+        assert "Блок облицовочный" in self.row.cargo
+        assert "Нанменование" not in self.row.cargo
+
+    def test_volume_joins_split_lines(self):
+        # «Нетто —\n20,52 т., Брутто —\n20,835 т., Объем —\n8,73 м³»
+        # должно склеиться в одну строку.
+        v = self.row.volume
+        assert "20,52" in v
+        assert "20,835" in v
+        assert "8,73" in v
+
+    def test_carrier_no_driver_annotation(self):
+        # «— (реквизиты, позволяющие идентифицировать водителя(-ей))» — мусор.
+        assert "реквизиты" not in self.row.carrier.lower()
+        assert "идентифицировать" not in self.row.carrier.lower()
+        assert "Рябов" in self.row.carrier
+
+    def test_reception_no_form_annotations(self):
+        # «(адрес места погрузки)» и подобные — форм-аннотации, не значение.
+        r = self.row.reception
+        assert "(адрес места погрузки)" not in r
+        assert "(заявленные дата" not in r
+        assert "Подолино" in r
+        assert "23.07.2022" in r
