@@ -475,6 +475,13 @@ class TestRealOcrV2:
         assert "7743553262" in s
         assert "отличным" not in s.lower()
         assert "(при наличи" not in s.lower()
+        # «ло организалии пёеревозки груза)» — OCR-вариант «по организации
+        # перевозки груза)»; это хвост шаблонной аннотации, в значение не попадает.
+        assert "организ" not in s.lower()
+        assert "перевозк" not in s.lower()
+        # Висячий ярлык «КПП» без значения — срезается.
+        assert not s.rstrip().endswith("КПП")
+        assert "ИНН 7743553262, КПП," not in s
 
     def test_cargo_clean(self):
         # «Блок облицовочный…720 нтт» — без шаблонных приложений формы.
