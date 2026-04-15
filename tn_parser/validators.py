@@ -66,8 +66,10 @@ def is_valid_grz(s: str) -> bool:
 # Поиск кандидата ГРЗ в «сыром» тексте — допускаем и латинские двойники,
 # позже нормализуем в кириллицу.
 GRZ_CANDIDATE = re.compile(
-    rf"{_GRZ_CHAR}\d{{3}}{_GRZ_CHAR}{{2}}\s?\d{{2,3}}|"
-    rf"{_GRZ_CHAR}{{2}}\d{{4}}\s?\d{{2,3}}"
+    # (?!\d) prevents matching inside longer digit sequences (e.g. ИНН7743553262
+    # where НН7743553 would otherwise look like a valid trailer plate).
+    rf"(?:(?:{_GRZ_CHAR}\d{{3}}{_GRZ_CHAR}{{2}}\s?\d{{2,3}}|"
+    rf"{_GRZ_CHAR}{{2}}\d{{4}}\s?\d{{2,3}}))(?!\d)"
 )
 
 

@@ -20,8 +20,15 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
 
-from .normalize import clean_value, is_garbage
+from .normalize import (
+    clean_value,
+    is_garbage,
+    is_noise_line,
+    is_ocr_garbage_token,
+    strip_garbage_tokens,
+)
 from .validators import (
+    GRZ_CANDIDATE,
     find_grz,
     format_grz,
     is_valid_date,
@@ -33,9 +40,9 @@ from .models import MISSING, GARBAGE
 _DATE_ANY = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
 
 # Номер: не захватываем "Экземпляр №" (подпись у графы экземпляра).
+# N[º°]? убран — голая латинская «N» слишком широкий маркер (матчит «RENAULT» и т.п.).
 _NUMBER_AFTER_SYMBOL = re.compile(
-    r"(?<!экземпляр\s)(?<!экз\s)"  # предшествующие слова исключаем
-    r"(?:№|No\.?|N[º°]?)\s*[:\-–—]?\s*"
+    r"(?:№|No\.?)\s*[:\-–—]?\s*"
     r"([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{0,48})",
     re.IGNORECASE,
 )
@@ -61,6 +68,8 @@ _SERVICE_LINE_RE = re.compile(
     r"|экземпляр\s*№?"
     r"|реквизиты\s+документа"
     r"|да\b|нет\b"
+    r"|заказчик\s+услуг\b"                 # «Заказчик услуг по организации…»
+    r"|при\s+наличи[ии]\b"                 # автономная пометка «(при наличии)»
     r"|[\[\(][\s xх×✓✔][\]\)]"   # чекбоксы
     r"|[\-–—=_\s]{3,}"            # разделители из дефисов
     r"|\([а-яА-Я]+\)"             # короткие пометки в скобках: «(а)», «(б)»
@@ -93,8 +102,41 @@ def _meaningful_lines(body: str) -> List[str]:
         # Строки с инструкцией-пояснением в стиле «(…текст…)» после значения:
         # «Самовывоз  (реквизиты, позволяющие…)» — чистим хвост.
         line = re.sub(r"\s*\([^)]*реквизиты[^)]*\)\s*$", "", line, flags=re.IGNORECASE)
+        # Чистим «Заказчик услуг … (при наличии)» — он может прилипнуть
+        # к строке с именем организации как левый префикс:
+        # «Га Заказчик услуг по организации, перевозки груза (при наличии), ООО …»
+        # Реальный OCR часто ставит запятую внутри фразы, поэтому [^,]* недостаточно.
+        # Решение: при наличии «заказчик услуг» на строке — ищем первую org-метку
+        # (ООО/АО/ИП…) и берём текст начиная с неё; если org-метки нет — вся строка
+        # является служебной пометкой и отбрасывается.
+        if re.search(r"заказчик\s+услуг", line, re.IGNORECASE):
+            m_org = re.search(r"\b(ООО|АО|ЗАО|ПАО|ИП|ПБОЮЛ)\b", line, re.IGNORECASE)
+            if m_org:
+                line = line[m_org.start():]
+            else:
+                continue
         line = line.strip(" \t,;")
-        if line and not is_garbage(line):
+        # Слишком короткие строки — почти наверняка OCR-мусор (одиночные
+        # символы/слоги): «Г», «а.», «ГЕР», «ав4'». Значимых данных не несут.
+        if len(line) <= 3:
+            continue
+        # Строка без единого содержательного слова (≥ 4 букв подряд), даты или
+        # длинного числа (ИНН/индекс) — OCR-мусор вроде «/ Й /», «11 [3] Т».
+        if (not re.search(r"[А-Яа-яЁёA-Za-z]{4,}", line)
+                and not re.search(r"\d{2}\.\d{2}\.\d{4}", line)
+                and not re.search(r"\d{5,}", line)):
+            continue
+        # Строка-шум по токен-статистике: большая доля мусорных токенов
+        # («іі-і», «Ц:і», «Бекам'тбд»).
+        if is_noise_line(line):
+            continue
+        # Чистим одиночные мусорные токены в строке (украинские буквы,
+        # апострофы-в-середине, 3+ переключения скриптов).
+        line = strip_garbage_tokens(line)
+        line = line.strip(" \t,;")
+        if not line or len(line) <= 3:
+            continue
+        if not is_garbage(line):
             out.append(line)
     return out
 
@@ -120,9 +162,19 @@ def extract_number_and_date(
         # Собираем все кандидаты и выбираем первый непустой/осмысленный.
         for rx in (_NUMBER_STICKY, _NUMBER_AFTER_SYMBOL):
             for m in rx.finditer(region):
-                # Проверяем, не «Экземпляр №» ли это (контекст слева 15 симв).
-                left_ctx = region[max(0, m.start() - 20): m.start()].lower()
-                if "экземпляр" in left_ctx or "экз." in left_ctx:
+                # Проверяем, не «Экземпляр №» ли это.
+                # Стратегия: смотрим на ближайшие 20 символов слева, но НЕ
+                # пересекаем границу строки. Это обрабатывает два случая:
+                #   а) «Экземпляр №\n№ 7145/Б» — переносы между строками:
+                #      second № не видит «экземпляр» из предыдущей строки.
+                #   б) «Экземпляр №  Дата 23.07.2022  № 7145/Б» — одна строка:
+                #      second № смотрит лишь 20 симв. назад → «23.07.2022  »,
+                #      «экземпляр» не попадает в окно.
+                line_start = region.rfind("\n", 0, m.start())
+                line_start = 0 if line_start < 0 else line_start + 1
+                near_start = max(line_start, m.start() - 20)
+                near_ctx = region[near_start: m.start()].lower()
+                if "экземпляр" in near_ctx or "экз." in near_ctx:
                     continue
                 candidate = m.group(1).strip(" .,:;")
                 if not candidate:
@@ -210,8 +262,10 @@ def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
             low = ln.lower()
 
             # "1. Наименование — Блок облицовочный…" → «Блок облицовочный…»
+            # Допускаем OCR-варианты: «Нанменование», «Наиименование» и т.п.:
+            # н + 1–5 произвольных символов + «мен» + хвост.
             m = re.match(
-                r"^\s*(?:\d+[.)]\s*)?наимен\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*(.+)$",
+                r"^\s*(?:\d+[.)]\s*)?н.{1,5}мен\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*(.+)$",
                 ln, re.IGNORECASE,
             )
             if m and m.group(1).strip():
@@ -297,9 +351,30 @@ def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
                 if len(parts) == 2 and parts[1].strip():
                     marka_parts.append(parts[1].strip())
                 continue
-            # Строка, в которой есть ГРЗ — игнорируем.
-            if grz and grz in re.sub(r"\s+", "", ln.upper()):
-                continue
+            # Строка, в которой есть ГРЗ.
+            if grz:
+                compact_ln = re.sub(
+                    r"(?<=[А-ЯЁA-Z0-9])\s+(?=[А-ЯЁA-Z0-9])", "", ln.upper()
+                )
+                m_grz = GRZ_CANDIDATE.search(compact_ln)
+                if m_grz:
+                    # Если найденный кандидат совпадает с нашим ГРЗ — эта строка
+                    # содержит ГРЗ. Пробуем вытащить марку из префикса до ГРЗ.
+                    if m_grz.start() > 0:
+                        # Считаем непробельные символы в оригинальной строке:
+                        # ищем позицию, где их накопилось m_grz.start() штук.
+                        ns = 0
+                        end_pos = len(ln)
+                        for ci, ch in enumerate(ln):
+                            if not ch.isspace():
+                                if ns == m_grz.start():
+                                    end_pos = ci
+                                    break
+                                ns += 1
+                        brand_raw = ln[:end_pos].strip(" ,;()")
+                        if brand_raw and len(brand_raw) >= 2:
+                            marka_parts.append(brand_raw)
+                    continue
             # Строки с инн/кпп — точно не ТС.
             if re.search(r"\b(инн|кпп|огрн|окпо)\b", low):
                 continue
@@ -363,6 +438,19 @@ def _looks_noisy(line: str) -> bool:
     s = line.strip()
     if not s:
         return True
+    # Строки ≤ 3 символов — одиночные литеры/слоги вроде «Г», «а.», «ГЕР».
+    if len(s) <= 3:
+        return True
+    # Украинские буквы/диакритика/встроенные апострофы по токенам.
+    if is_noise_line(s):
+        return True
+    # Нет ни одного «осмысленного» слова (≥ 4 букв подряд), ни даты, ни
+    # длинного числа (телефон/ИНН/индекс)? Значит строка — OCR-мусор вроде
+    # «11 [3] Т» или «000 д».
+    if (not re.search(r"[А-Яа-яЁёA-Za-z]{4,}", s)
+            and not re.search(r"\d{2}\.\d{2}\.\d{4}", s)
+            and not re.search(r"\d{5,}", s)):
+        return True
     alnum = sum(1 for c in s if c.isalnum())
     if alnum == 0:
         return True
@@ -386,7 +474,16 @@ def extract_reception(section_body: str, full_text: str) -> Tuple[str, float]:
     if section_body:
         body = _RECEPTION_STOP.split(section_body, maxsplit=1)[0]
         lines = [ln for ln in body.splitlines() if not _looks_noisy(ln)]
-        lines = [ln.strip() for ln in lines if ln.strip()]
+        # В выживших строках ещё раз выпиливаем одиночные мусорные токены.
+        lines = [strip_garbage_tokens(ln.strip()) for ln in lines]
+        # После стрипинга строка может потерять все осмысленные слова — как
+        # «000 д» после удаления «"Бекам'тбд». Такие остатки — шум.
+        lines = [
+            ln for ln in lines
+            if ln and len(ln) > 3 and re.search(
+                r"[А-Яа-яЁёA-Za-z]{4,}|\d{5,}|\d{2}\.\d{2}\.\d{4}", ln
+            )
+        ]
         # Отбрасываем повторный блок с реквизитами грузоотправителя, если
         # он идёт ВТОРЫМ (такое бывает, когда «Приём груза» копирует контент
         # из раздела 1 — нам это неинтересно, у нас уже есть shipper).
