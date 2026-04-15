@@ -20,7 +20,13 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
 
-from .normalize import clean_value, is_garbage
+from .normalize import (
+    clean_value,
+    is_garbage,
+    is_noise_line,
+    is_ocr_garbage_token,
+    strip_garbage_tokens,
+)
 from .validators import (
     find_grz,
     format_grz,
@@ -97,9 +103,11 @@ def _meaningful_lines(body: str) -> List[str]:
         line = re.sub(r"\s*\([^)]*реквизиты[^)]*\)\s*$", "", line, flags=re.IGNORECASE)
         # Чистим «Заказчик услуг … (при наличии)» — он может прилипнуть
         # к строке с именем организации как левый префикс:
-        # «Га Заказчик услуг по организации перевозки груза (при наличии)»
+        # «Га Заказчик услуг по организации перевозки груза (при наличии), ООО …»
+        # Жадный `[^,]*` съест «по организации перевозки груза», затем опциональная
+        # скобка `(при наличии)` и хвостовая запятая/пробелы.
         line = re.sub(
-            r"^.*?заказчик\s+услуг\s+по\s+организации[^,]*?(?:\([^)]*\))?\s*,?\s*",
+            r"^.*?заказчик\s+услуг[^,]*(?:\([^)]*\))?\s*,?\s*",
             "", line, flags=re.IGNORECASE,
         )
         line = line.strip(" \t,;")
@@ -107,7 +115,17 @@ def _meaningful_lines(body: str) -> List[str]:
         # символы/слоги): «Г», «а.», «ГЕР», «ав4'». Значимых данных не несут.
         if len(line) <= 3:
             continue
-        if line and not is_garbage(line):
+        # Строка-шум по токен-статистике: большая доля мусорных токенов
+        # («іі-і», «Ц:і», «Бекам'тбд»).
+        if is_noise_line(line):
+            continue
+        # Чистим одиночные мусорные токены в строке (украинские буквы,
+        # апострофы-в-середине, 3+ переключения скриптов).
+        line = strip_garbage_tokens(line)
+        line = line.strip(" \t,;")
+        if not line or len(line) <= 3:
+            continue
+        if not is_garbage(line):
             out.append(line)
     return out
 
@@ -384,6 +402,16 @@ def _looks_noisy(line: str) -> bool:
     # Строки ≤ 3 символов — одиночные литеры/слоги вроде «Г», «а.», «ГЕР».
     if len(s) <= 3:
         return True
+    # Украинские буквы/диакритика/встроенные апострофы по токенам.
+    if is_noise_line(s):
+        return True
+    # Нет ни одного «осмысленного» слова (≥ 4 букв подряд), ни даты, ни
+    # длинного числа (телефон/ИНН/индекс)? Значит строка — OCR-мусор вроде
+    # «11 [3] Т» или «000 д».
+    if (not re.search(r"[А-Яа-яЁёA-Za-z]{4,}", s)
+            and not re.search(r"\d{2}\.\d{2}\.\d{4}", s)
+            and not re.search(r"\d{5,}", s)):
+        return True
     alnum = sum(1 for c in s if c.isalnum())
     if alnum == 0:
         return True
@@ -407,7 +435,16 @@ def extract_reception(section_body: str, full_text: str) -> Tuple[str, float]:
     if section_body:
         body = _RECEPTION_STOP.split(section_body, maxsplit=1)[0]
         lines = [ln for ln in body.splitlines() if not _looks_noisy(ln)]
-        lines = [ln.strip() for ln in lines if ln.strip()]
+        # В выживших строках ещё раз выпиливаем одиночные мусорные токены.
+        lines = [strip_garbage_tokens(ln.strip()) for ln in lines]
+        # После стрипинга строка может потерять все осмысленные слова — как
+        # «000 д» после удаления «"Бекам'тбд». Такие остатки — шум.
+        lines = [
+            ln for ln in lines
+            if ln and len(ln) > 3 and re.search(
+                r"[А-Яа-яЁёA-Za-z]{4,}|\d{5,}|\d{2}\.\d{2}\.\d{4}", ln
+            )
+        ]
         # Отбрасываем повторный блок с реквизитами грузоотправителя, если
         # он идёт ВТОРЫМ (такое бывает, когда «Приём груза» копирует контент
         # из раздела 1 — нам это неинтересно, у нас уже есть shipper).

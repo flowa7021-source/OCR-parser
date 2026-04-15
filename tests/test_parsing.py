@@ -280,3 +280,33 @@ class TestOcrNoise:
         r = self.row.reception
         assert "ГЕР" not in r
         assert "Бекам" in r
+
+    def test_reception_no_ukrainian_letters(self):
+        # Украинские і/ї/є/ґ в русских ТН не встречаются — всегда OCR-шум.
+        r = self.row.reception
+        for ch in "іїєґ":
+            assert ch not in r, f"ukrainian letter {ch!r} leaked into reception"
+
+    def test_reception_no_embedded_quotes(self):
+        # «Бекам'тбд», «'Г'чп» — апострофы внутри слов должны быть выпилены.
+        r = self.row.reception
+        assert "Бекам'" not in r
+        assert "'Г'" not in r
+        assert "'|_'" not in r
+
+    def test_shipper_no_ukrainian_letters(self):
+        s = self.row.shipper
+        for ch in "іїєґ":
+            assert ch not in s, f"ukrainian letter {ch!r} leaked into shipper"
+
+    def test_reception_has_no_residual_junk(self):
+        # «000 д», «11 [3] Т» после чистки не должны оставаться.
+        r = self.row.reception
+        for junk in ("000 д", "11 [3]", " д\n", "\nд\n"):
+            assert junk not in r, f"residual junk {junk!r} in reception"
+
+    def test_shipper_has_no_service_tail(self):
+        # «перевозки груза (при наличии)» — служебный хвост.
+        s = self.row.shipper.lower()
+        assert "(при наличи" not in s
+        assert "перевозки груза" not in s
