@@ -266,6 +266,19 @@ def extract_org(
 # ---------------------------------------------------------------------------
 
 
+# Шаблонные фразы из бланка ТН, которые OCR захватывает как «груз».
+# «(отгрузочное наименование груза (для опасных грузов — в соответствии с ДОПОГ/МГ)»,
+# «его состояние и», «(наименование груза)» и т.п.
+_CARGO_TEMPLATE_RE = re.compile(
+    r"отгрузочное\s+наименование\s+груза"
+    r"|для\s+опасных\s+груз"
+    r"|в\s+соответствии\s+с\s+(?:допог|мг\b)"
+    r"|его\s+состояние\s+и\b"
+    r"|наименование\s+(?:ИНН\b|груза\b.*\()",  # подсказки в скобках
+    re.IGNORECASE,
+)
+
+
 def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
     """Извлекает наименование груза, снимая префикс «Наименование —»."""
     if section_body:
@@ -273,6 +286,10 @@ def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
         cleaned: List[str] = []
         for ln in lines:
             low = ln.lower()
+
+            # Строка — шаблонный текст бланка ТН: пропускаем.
+            if _CARGO_TEMPLATE_RE.search(ln):
+                continue
 
             # Строка-заголовок без значения: «1. Нанменование —» (OCR разбил
             # на отдельную строку, значение идёт следующей строкой).
@@ -339,6 +356,17 @@ def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
 _VOLUME_KW = re.compile(r"\b(нетто|брутто|объ[её]м|масс[аы]|вес\b)", re.IGNORECASE)
 _VOLUME_NUM = re.compile(r"\d")
 
+# Количество товара на строке наименования груза: «720 шт», «15 паллет», «50 упак.»
+# Используется как запасной вариант для объёма, когда нет строк Нетто/Брутто.
+_QTY_ON_CARGO_LINE = re.compile(
+    r"\b(\d+(?:[.,\s]\d+)*)\s*"
+    r"(шт\.?|штук[аи]?|уп\.?|упак\.?|упаковк[аи]?"
+    r"|паллет[аы]?|пал\.?|поддон[аы]?"
+    r"|коробк[аи]?|ящик[аи]?|мешк[аи]?"
+    r"|рул[яей]?|единиц[аы]?)\b",
+    re.IGNORECASE,
+)
+
 
 def extract_volume(section_body: str, full_text: str) -> Tuple[str, float]:
     """Извлекает строку с весом/объёмом груза (Нетто/Брутто/Объём)."""
@@ -363,6 +391,16 @@ def extract_volume(section_body: str, full_text: str) -> Tuple[str, float]:
             if _VOLUME_KW.search(s) and _VOLUME_NUM.search(s):
                 if not is_garbage(s):
                     return s, 0.9
+
+        # Запасной вариант: количество на строке наименования груза
+        # («720 шт», «15 паллет»). Применяется только если строк Нетто/Брутто нет.
+        for s in joined:
+            m = _QTY_ON_CARGO_LINE.search(s)
+            if m and not _VOLUME_KW.search(s):
+                qty = m.group(0).strip()
+                if qty and not is_garbage(qty):
+                    return qty, 0.6
+
     if full_text:
         for m in _VOLUME_KW.finditer(full_text):
             ls = full_text.rfind("\n", 0, m.start())

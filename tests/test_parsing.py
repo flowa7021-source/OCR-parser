@@ -434,3 +434,85 @@ class TestRealOcrFormat:
         assert "(заявленные дата" not in r
         assert "Подолино" in r
         assert "23.07.2022" in r
+
+
+# ---------------------------------------------------------------------------
+
+
+_CARGO_QTY_ONLY = """\
+1. Грузоотправитель
+ООО Тест, ИНН 1234567890
+
+2. Грузополучатель
+ИП Иванов, г. Воронеж
+
+3. Груз
+Кирпич строительный М-150, красный, 500 шт
+
+6. Перевозчик
+ООО Транс
+
+7. Транспортное средство
+КАМАЗ А 123 БВ 36
+"""
+
+
+class TestVolumeQuantityFallback:
+    """Когда нет строк Нетто/Брутто — объём берётся из количества на строке груза."""
+
+    def setup_method(self) -> None:
+        from tn_parser.normalize import normalize_for_sections
+        rows = parse_text(normalize_for_sections(_CARGO_QTY_ONLY), "test.pdf")
+        assert len(rows) == 1
+        self.row = rows[0]
+
+    def test_volume_from_quantity(self):
+        # Нет строк «Нетто/Брутто» — должны взять «500 шт» как объём.
+        v = self.row.volume
+        assert "500" in v
+        assert "шт" in v.lower()
+
+    def test_cargo_still_has_name(self):
+        assert "Кирпич" in self.row.cargo
+
+
+class TestCargoTemplateTextFiltered:
+    """Шаблонные фразы из бланка ТН не попадают в поле «Груз»."""
+
+    _TEXT = """\
+1. Грузоотправитель
+ООО Отправитель, ИНН 9876543210
+
+2. Грузополучатель
+ООО Получатель, г. Самара
+
+3. Груз
+1. Наименование —
+Щебень гранитный фр. 5-20, 30 т
+(отгрузочное наименование груза (для опасных грузов — в соответствии с ДОПОГ/МГ),
+его состояние и)
+Нетто — 30 т., Брутто — 30,5 т.
+
+6. Перевозчик
+ИП Петров
+
+7. Транспортное средство
+VOLVO В 456 МН 63
+"""
+
+    def setup_method(self) -> None:
+        from tn_parser.normalize import normalize_for_sections
+        rows = parse_text(normalize_for_sections(self._TEXT), "test.pdf")
+        assert len(rows) == 1
+        self.row = rows[0]
+
+    def test_cargo_no_template_text(self):
+        assert "отгрузочное" not in self.row.cargo.lower()
+        assert "опасных грузов" not in self.row.cargo.lower()
+        assert "его состояние" not in self.row.cargo.lower()
+
+    def test_cargo_has_name(self):
+        assert "Щебень" in self.row.cargo
+
+    def test_volume_has_weight(self):
+        assert "30" in self.row.volume

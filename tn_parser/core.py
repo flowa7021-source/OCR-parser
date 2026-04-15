@@ -25,7 +25,7 @@ from .claude_fallback import CONFIDENCE_THRESHOLD, claude_enhance
 
 
 LOW_TEXT_THRESHOLD = 200  # символов
-CACHE_VERSION = 9  # ↑ при изменении логики парсинга
+CACHE_VERSION = 10  # ↑ при изменении логики парсинга
 
 
 # ---------------------------------------------------------------------------
