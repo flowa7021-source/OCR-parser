@@ -36,14 +36,6 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
-      - name: Cache PyInstaller build artifacts
-        uses: actions/cache@v4
-        with:
-          path: build
-          key: pyinstaller-build-${{ runner.os }}-${{ hashFiles('transport_parser.py', 'requirements.txt') }}
-          restore-keys: |
-            pyinstaller-build-${{ runner.os }}-
-
       - name: Determine version and release tag
         id: meta
         shell: bash
