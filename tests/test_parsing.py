@@ -217,3 +217,66 @@ class TestEmptyInput:
         assert r.consignee == MISSING
         assert "LOW_TEXT" in r.note
         assert r.confidence.overall() == 0.0
+
+
+class TestOcrNoise:
+    """Реальный OCR-шум: три системные проблемы.
+
+    1. Номер: «Экземпляр №» стоит на строке ВЫШЕ реального «№ 7145/Б» →
+       left-context-окно в 20 символов ошибочно включало «экземпляр» из
+       предыдущей строки и пропускало правильный номер.
+
+    2. ГРЗ: ИНН 7743553262 в разделе «Транспортное средство» после
+       компактизации пробелов даёт «ИНН7743553262», откуда «НН7743553»
+       ложно распознаётся как прицепной ГРЗ.
+
+    3. Грузоотправитель/Приём: фраза «Заказчик услуг по организации
+       перевозки груза» и короткие OCR-мусорные строки («Г», «а.», «ГЕР»)
+       прилипают к содержательному блоку.
+    """
+
+    def setup_method(self) -> None:
+        rows = parse_text(_text("tn_ocr_noise.txt"), "tn_ocr_noise.pdf")
+        assert len(rows) == 1
+        self.row = rows[0]
+
+    # --- Проблема 1: номер -----------------------------------------------
+
+    def test_number_extracted_despite_ekzemplyar_on_prev_line(self):
+        # «Экземпляр №» на строке выше «№ 7145/Б» не должен блокировать
+        # извлечение реального номера.
+        assert self.row.number == "7145/Б"
+
+    def test_date_extracted(self):
+        assert self.row.date == "23.07.2022"
+
+    # --- Проблема 2: ГРЗ vs ИНН ------------------------------------------
+
+    def test_vehicle_grz_not_inn_false_positive(self):
+        # ИНН 7743553262 в секции ТС не должен стать «НН 7743 553».
+        assert "НН 7743 553" not in self.row.vehicle
+        assert "7743553262" not in self.row.vehicle
+
+    def test_vehicle_has_real_grz(self):
+        assert "Р 814 НР 152" in self.row.vehicle
+
+    def test_vehicle_has_brand(self):
+        assert "RENAULT" in self.row.vehicle
+
+    # --- Проблема 3: шум в грузоотправителе/приёме -----------------------
+
+    def test_shipper_no_zakazchik_prefix(self):
+        # «Заказчик услуг по организации перевозки груза» — служебная метка.
+        assert "заказчик" not in self.row.shipper.lower()
+
+    def test_shipper_no_short_noise(self):
+        # «Га» (OCR-мусор) не должен попасть в начало поля.
+        assert not self.row.shipper.startswith("Га")
+        assert "Бекам" in self.row.shipper
+        assert "7743553262" in self.row.shipper
+
+    def test_reception_no_ocr_garbage(self):
+        # Строки «'|_' г-.:», «Г», «а.», «ГЕР» — чистый OCR-мусор.
+        r = self.row.reception
+        assert "ГЕР" not in r
+        assert "Бекам" in r

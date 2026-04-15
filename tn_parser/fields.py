@@ -61,6 +61,8 @@ _SERVICE_LINE_RE = re.compile(
     r"|экземпляр\s*№?"
     r"|реквизиты\s+документа"
     r"|да\b|нет\b"
+    r"|заказчик\s+услуг\b"                 # «Заказчик услуг по организации…»
+    r"|при\s+наличи[ии]\b"                 # автономная пометка «(при наличии)»
     r"|[\[\(][\s xх×✓✔][\]\)]"   # чекбоксы
     r"|[\-–—=_\s]{3,}"            # разделители из дефисов
     r"|\([а-яА-Я]+\)"             # короткие пометки в скобках: «(а)», «(б)»
@@ -93,7 +95,18 @@ def _meaningful_lines(body: str) -> List[str]:
         # Строки с инструкцией-пояснением в стиле «(…текст…)» после значения:
         # «Самовывоз  (реквизиты, позволяющие…)» — чистим хвост.
         line = re.sub(r"\s*\([^)]*реквизиты[^)]*\)\s*$", "", line, flags=re.IGNORECASE)
+        # Чистим «Заказчик услуг … (при наличии)» — он может прилипнуть
+        # к строке с именем организации как левый префикс:
+        # «Га Заказчик услуг по организации перевозки груза (при наличии)»
+        line = re.sub(
+            r"^.*?заказчик\s+услуг\s+по\s+организации[^,]*?(?:\([^)]*\))?\s*,?\s*",
+            "", line, flags=re.IGNORECASE,
+        )
         line = line.strip(" \t,;")
+        # Слишком короткие строки — почти наверняка OCR-мусор (одиночные
+        # символы/слоги): «Г», «а.», «ГЕР», «ав4'». Значимых данных не несут.
+        if len(line) <= 3:
+            continue
         if line and not is_garbage(line):
             out.append(line)
     return out
@@ -120,9 +133,14 @@ def extract_number_and_date(
         # Собираем все кандидаты и выбираем первый непустой/осмысленный.
         for rx in (_NUMBER_STICKY, _NUMBER_AFTER_SYMBOL):
             for m in rx.finditer(region):
-                # Проверяем, не «Экземпляр №» ли это (контекст слева 15 симв).
-                left_ctx = region[max(0, m.start() - 20): m.start()].lower()
-                if "экземпляр" in left_ctx or "экз." in left_ctx:
+                # Проверяем, не «Экземпляр №» ли это: смотрим только в
+                # пределах ТЕКУЩЕЙ строки (до \n), а не 20 символов назад.
+                # Это исключает ложное срабатывание когда «Экземпляр №»
+                # стоит на строке ВЫШЕ реального «№ 7145/Б».
+                line_start = region.rfind("\n", 0, m.start())
+                line_start = 0 if line_start < 0 else line_start + 1
+                same_line_ctx = region[line_start: m.start()].lower()
+                if "экземпляр" in same_line_ctx or "экз." in same_line_ctx:
                     continue
                 candidate = m.group(1).strip(" .,:;")
                 if not candidate:
@@ -362,6 +380,9 @@ _RECEPTION_NOISE_CHARS = set("[](){}|\\/=_~^`<>*#$%")
 def _looks_noisy(line: str) -> bool:
     s = line.strip()
     if not s:
+        return True
+    # Строки ≤ 3 символов — одиночные литеры/слоги вроде «Г», «а.», «ГЕР».
+    if len(s) <= 3:
         return True
     alnum = sum(1 for c in s if c.isalnum())
     if alnum == 0:
