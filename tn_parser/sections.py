@@ -117,16 +117,131 @@ _BARE = re.compile(
     + r")\b[^\n]{0,80}$"
 )
 
+# Кандидат в заголовок с OCR-искажённым префиксом: вместо «1.»/«2)» —
+# «&,», «5;», «%.», «| 1.». Если за мусором видна русская фраза длиной
+# ≥ 6 букв, _classify_title попробует сопоставить её (в т.ч. fuzzy).
+#
+# Не ставим диапазоны из [А-Яа-яЁё] напрямую в квантификатор — это
+# порождает ложные срабатывания на обычных строках контента.
+# Минимум 6 букв на старте отсекает обычные «ООО …», «ИНН …», «АО …».
+_HEADER_CANDIDATE = re.compile(
+    r"(?m)^"
+    # ВАЖНО: только ГОРИЗОНТАЛЬНЫЕ пробелы/табы в классе junk — никаких
+    # \s/\n. Иначе класс съедает перевод строки и матч уползает в
+    # предыдущую строку («—» / пустую строку перед заголовком), и
+    # position маркера становится далеко от реального заголовка.
+    r"[ \t|_\-–—=\\/&%§№.,;·*°º‚`'\"‹›«»()\[\]]{0,6}"  # OCR-мусор
+    r"(?:\d{1,2}[ \t]*[.)\u00a0:;,]?[ \t]*)?"           # опц. цифра-префикс
+    r"([А-ЯЁ][А-Яа-яёЁ][А-Яа-яёЁ\- ]{4,70})"           # русская фраза ≥ 6 букв
+)
+
+
+def _strip_leading_junk(s: str) -> str:
+    """Сносит ведущие OCR-символы-мусор («| 1. Грузо…», «&, Перевозчик»)."""
+    return re.sub(
+        r"^[\s|_\-–—=\\/&%§№.,;·*°º‚`'\"‹›«»()\[\]]+", "", s
+    )
+
+
+def _matches_prefix(text: str, prefix: str) -> bool:
+    """`startswith` + проверка границы слова ПОСЛЕ prefix.
+
+    Без границы слова короткий ключ «груз» матчится посреди слова
+    «грузоотправитель» (и слова-OCR-искажения вроде «грузоатиравитель»),
+    из-за чего раздел получает не ту роль.
+    """
+    if not text.startswith(prefix):
+        return False
+    if prefix and prefix[-1].isalpha():
+        tail = text[len(prefix):]
+        if tail and tail[0].isalpha():
+            return False
+    return True
+
+
+def _edit_distance_leq(a: str, b: str, cap: int) -> bool:
+    """True, если расстояние Левенштейна между `a` и `b` ≤ cap.
+
+    Ранний выход: как только строка текущей DP-матрицы не содержит
+    значений ≤ cap, возвращаем False. На практике для кандидатов
+    заголовков (до 20 символов) время микросекунды.
+    """
+    la, lb = len(a), len(b)
+    if abs(la - lb) > cap:
+        return False
+    # prev[j] = расстояние редактирования между a[:0] и b[:j]
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        curr = [i] + [0] * lb
+        best_in_row = curr[0]
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+            if curr[j] < best_in_row:
+                best_in_row = curr[j]
+        if best_in_row > cap:
+            return False
+        prev = curr
+    return prev[lb] <= cap
+
+
+def _fuzzy_match_keyword(low: str, keyword: str, max_dist: int) -> bool:
+    """Fuzzy-сопоставление ключевого слова с префиксом строки заголовка.
+
+    Учитываем, что длина OCR-варианта может отличаться от канонической
+    на ± max_dist; берём скользящее окно соответствующей длины в начале
+    low и меряем расстояние Левенштейна.
+    """
+    # Слишком короткие ключи не фаззим: риск ложных срабатываний большой.
+    if len(keyword) < 8:
+        return False
+    for delta in range(-max_dist, max_dist + 1):
+        win_len = len(keyword) + delta
+        if win_len <= 0 or win_len > len(low):
+            continue
+        window = low[:win_len]
+        if _edit_distance_leq(window, keyword, max_dist):
+            # После OCR-варианта должна быть не-буква (чтобы не срезать
+            # только часть более длинного слова).
+            tail = low[win_len:]
+            if not tail or not tail[0].isalpha():
+                return True
+    return False
+
 
 def _classify_title(title: str) -> Optional[str]:
-    """По тексту заголовка определяет роль или "__ignored__"."""
-    low = title.lower().strip()
+    """По тексту заголовка определяет роль или "__ignored__".
+
+    Три шага:
+      1) Стрипаем ведущий OCR-мусор («|», «&», «%» и т.п.).
+      2) Точное сопоставление c проверкой границы слова (чтобы «груз»
+         не матчилось посреди «грузоотправитель»).
+      3) Fuzzy-сопоставление (Левенштейн ≤ 2) для длинных ключей —
+         ловит OCR-искажения вроде «Грузоатиравитель», «Срузосотправитель»,
+         «Грузоотиравитель» → shipper; «Пэревозчик», «Лерезозчик» →
+         carrier и т.п.
+    """
+    low = _strip_leading_junk(title).lower().strip()
+    if not low:
+        return None
+
+    # (2) Точный префикс с word-boundary.
     for ign in _IGNORED_TITLES:
-        if low.startswith(ign):
+        if _matches_prefix(low, ign):
             return "__ignored__"
     for role, names in _ROLE_TITLES:
         for name in names:
-            if low.startswith(name):
+            if _matches_prefix(low, name):
+                return role
+
+    # (3) Fuzzy для длинных ключей. Ignored проверяем первыми, чтобы
+    # при совпадении с шаблонной фразой (а не данными) не вернуть роль.
+    for ign in _IGNORED_TITLES:
+        if _fuzzy_match_keyword(low, ign, 2):
+            return "__ignored__"
+    for role, names in _ROLE_TITLES:
+        for name in names:
+            if _fuzzy_match_keyword(low, name, 2):
                 return role
     return None
 
@@ -145,15 +260,32 @@ def _find_markers(text: str) -> List[Tuple[int, str, str]]:
     candidates: List[Tuple[int, str, str]] = []
 
     def _best_keyword(title: str) -> str:
-        """Находит самый длинный из известных префиксов, совпавший с title."""
-        low = title.lower().strip()
+        """Находит самый длинный из известных префиксов, совпавший с title.
+
+        Если точного совпадения нет (OCR-искажение), возвращает тот
+        канонический ключ, с которым строка ближе всего по Левенштейну
+        (edit distance ≤ 2). Нужен split_sections, чтобы правильно
+        отсечь заголовок от inline-значения на одной строке.
+        """
+        low = _strip_leading_junk(title).lower().strip()
         best = ""
+        # Точное совпадение — в приоритете.
         for ign in _IGNORED_TITLES:
-            if low.startswith(ign) and len(ign) > len(best):
+            if _matches_prefix(low, ign) and len(ign) > len(best):
                 best = ign
         for _role, names in _ROLE_TITLES:
             for name in names:
-                if low.startswith(name) and len(name) > len(best):
+                if _matches_prefix(low, name) and len(name) > len(best):
+                    best = name
+        if best:
+            return best
+        # Fuzzy: выбираем ключ с наименьшим расстоянием редактирования.
+        for ign in _IGNORED_TITLES:
+            if _fuzzy_match_keyword(low, ign, 2) and len(ign) > len(best):
+                best = ign
+        for _role, names in _ROLE_TITLES:
+            for name in names:
+                if _fuzzy_match_keyword(low, name, 2) and len(name) > len(best):
                     best = name
         return best
 
@@ -168,6 +300,23 @@ def _find_markers(text: str) -> List[Tuple[int, str, str]]:
         role = _classify_title(m.group(1))
         if role is not None:
             candidates.append((m.start(), role, _best_keyword(m.group(1))))
+
+    # 3) Кандидаты с мусором/OCR-искажением в префиксе. Лоим их fuzzy-
+    # сопоставлением, чтобы не потерять секцию из-за замены одной буквы
+    # в «Грузоотправитель» или замены «6.» на «&,» в «6. Перевозчик».
+    seen_positions: set[int] = {pos for pos, _r, _k in candidates}
+    for m in _HEADER_CANDIDATE.finditer(text):
+        # Дубликаты с уже найденными — пропускаем.
+        title = m.group(1)
+        role = _classify_title(title)
+        if role is None:
+            continue
+        # Координата начала _строки_, а не заголовка — так он становится
+        # маркером границы раздела (всё, что выше, уходит в предыдущий раздел).
+        if m.start() in seen_positions:
+            continue
+        candidates.append((m.start(), role, _best_keyword(title)))
+        seen_positions.add(m.start())
 
     # Первое вхождение каждой роли.
     seen_roles: set[str] = set()

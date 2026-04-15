@@ -655,6 +655,74 @@ class TestRealOcrV3:
             assert junk not in r, f"template junk {junk!r} leaked into reception"
 
 
+class TestMultiOcrGarbledHeaders:
+    """Регрессия на сырой OCR с МНОГИМИ искажениями ключевых слов.
+
+    Реальный документ, который не парсился до добавления fuzzy-логики:
+      — «1. Грузоатиравитель» (а→о, и→п, пропущена 2-я о) — OCR испортил
+        ключ «Грузоотправитель» так, что точный startswith не ловил;
+        ранее строка матчилась как «груз» (cargo!) и раздел отправителя
+        был потерян.
+      — «&, Перевозчик» — цифра «6» распозналась как «&», двоеточие-запятая
+        вместо точки. Старый _NUMBERED не ловил, раздел оставался пустым.
+      — «Грузоатиравитель», «Срузосотправитель», «Грузоотиравитель» — три
+        разных OCR-варианта одного слова. Все должны резолвиться в shipper.
+      — «2908-23 А» — пробел внутри номера, нужно склеить.
+      — Короткие OCR-обрывки внутри shipper/consignee («| пинает») не
+        должны попадать в значение.
+    """
+
+    def setup_method(self) -> None:
+        rows = parse_text(_text("tn_multi_ocr.txt"), "tn_multi_ocr.pdf")
+        assert len(rows) == 1
+        self.row = rows[0]
+
+    def test_number_includes_trailing_letter(self):
+        # OCR вставил пробел в «2908-23А» → парсер должен его склеить.
+        assert self.row.number == "2908-23А"
+
+    def test_shipper_resolved_despite_garbled_header(self):
+        # Заголовок «1. Грузоатиравитель» — 2 OCR-ошибки. Fuzzy должен
+        # сопоставить его с ролью «shipper», иначе shipper был бы пустым.
+        s = self.row.shipper
+        assert s != "отсутствует"
+        assert "ГЕКСАФОРМ" in s
+        assert "7813266190" in s
+        # Короткие OCR-обрывки («| пинает», «является экспелитоэ ом») —
+        # не попадают в shipper.
+        assert "пинает" not in s
+        assert "является" not in s.lower()
+
+    def test_consignee_resolved(self):
+        c = self.row.consignee
+        assert "Моспроект" in c
+        assert "7707820890" in c
+
+    def test_carrier_is_driver_fio(self):
+        # «Беляев Александр Николаевич/Николаенич» — OCR часто ломает
+        # окончание. Любое ФИО-подобное значение — приемлемо.
+        c = self.row.carrier
+        assert c.startswith("Беляев")
+        assert "ДЕЛОВЫЕ ПЕРЕВОЗКИ" not in c
+
+    def test_vehicle_has_grz(self):
+        # В этом OCR ГРЗ — «С 201 ВХ 152» (с Cyr «С», «В», «Х»).
+        assert "201" in self.row.vehicle
+        assert "152" in self.row.vehicle
+
+    def test_reception_has_real_data(self):
+        r = self.row.reception
+        assert "ГЕКСАФОРМ" in r
+        assert "Петергоф" in r or "Астрономическая" in r
+        assert "29.08.2022" in r
+
+    def test_confidence_not_zero(self):
+        # На сильно шумном OCR уверенность естественно ниже 1.0, но
+        # и до нуля не должна падать — иначе Claude-fallback зря жжёт
+        # токены на каждом прогоне.
+        assert self.row.confidence.overall() >= 0.5
+
+
 class TestForm1T:
     """«Типовая межотраслевая форма № 1-Т» (пост. Госкомстата №78 от 28.11.97).
 
