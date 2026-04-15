@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Интеграционные тесты парсинга на текстовых фикстурах."""
 
+import re
 from pathlib import Path
 
 from tn_parser import MISSING, parse_text
@@ -89,8 +90,11 @@ class TestRealSample7145B:
         assert "Блок облицовочный" in self.row.cargo
         assert "Наименование" not in self.row.cargo
 
-    def test_carrier_samovyvoz(self):
-        assert "Самовывоз" in self.row.carrier
+    def test_carrier_is_driver(self):
+        # В поле «Перевозчик» помещаем только ФИО водителя: при самовывозе
+        # юрлица-перевозчика нет, в двухколоночных макетах ФИО стоит справа.
+        assert "Рябов" in self.row.carrier
+        assert "Самовывоз" not in self.row.carrier
 
     def test_vehicle_has_grz_with_spaces(self):
         # Канонический вид ГРЗ: "Р 814 НР 152".
@@ -559,6 +563,96 @@ class TestRealOcrV2:
         # «Ин 7743553262» → «ИНН 7743553262» (восстанавливаем 3-ю букву,
         # часто теряемую OCR на границе ячейки).
         assert "ИНН 7743553262" in self.row.reception
+
+
+class TestRealOcrV3:
+    """Ещё один реальный OCR-дамп с другими системными артефактами.
+
+    - Грузоотправитель: в разделе есть мусор «| является экспедитором |||»
+      (пайпы перед заголовком-шумом) и обрезанный хвост «по организации».
+    - Грузополучатель: после настоящих реквизитов идёт OCR-искажённый хвост
+      «Преквисит 4, Гручопииучателя)» (был «(реквизиты, позволяющие
+      идентифицировать Грузополучателя)»).
+    - Груз: три номерные позиции слитно в одной строке — нужно разложить.
+    - Перевозчик: слева юрлицо, справа ФИО «Беляев Александр Николаевич…».
+      В поле должно попасть только ФИО.
+    - Приём груза: есть обрывок «(нанменование {ИНН владен» (не закрытая
+      скобка) и шаблонные фразы про «пункта погруз». Должны быть вычищены.
+    """
+
+    def setup_method(self) -> None:
+        rows = parse_text(_text("tn_real_ocr_v3.txt"), "tn_real_ocr_v3.pdf")
+        assert len(rows) == 1
+        self.row = rows[0]
+
+    def test_number_and_date(self):
+        assert self.row.number == "2908-23А"
+        assert self.row.date == "29.08.2022"
+
+    def test_shipper_starts_at_org(self):
+        s = self.row.shipper
+        assert s.startswith("ООО")
+        assert "ГЕКСАФОРМ" in s
+        assert "7813266190" in s
+        assert "является" not in s.lower()
+        assert "|" not in s                      # OCR-пайпы убраны
+        # Обрезанный хвост «по организации» не попадает.
+        assert not s.rstrip(" ,;").lower().endswith("по организации")
+        assert "организации" not in s.lower()
+
+    def test_consignee_no_garbled_tail(self):
+        c = self.row.consignee
+        assert "Моспроект" in c
+        assert "7707820890" in c
+        # OCR-хвост «Преквисит 4, Гручопииучателя)» не попадает.
+        assert "Преквисит" not in c
+        assert "Гручопииучателя" not in c
+        assert not c.rstrip().endswith(")")
+
+    def test_cargo_splits_numbered_items(self):
+        c = self.row.cargo
+        # Все три позиции должны остаться — и быть на ОТДЕЛЬНЫХ строках.
+        assert "Гексагональная" in c
+        assert "Одноосная" in c
+        assert "Закладная" in c
+        lines = c.split("\n")
+        numbered = [ln for ln in lines if re.match(r"^\s*\d+[.)]\s", ln)]
+        assert len(numbered) == 3
+        # Артикул «ТriАх160» (смешанные кирилл-латин-кирилл) сохранён —
+        # его стрипил слишком агрессивный фильтр скриптов.
+        assert "ТriАх160" in c or "Ах160" in c
+
+    def test_carrier_is_driver_only(self):
+        # В двухколоночном перевозчике ФИО стоит справа. Юрлицо не нужно.
+        c = self.row.carrier
+        assert c == "Беляев Александр Николаевич"
+
+    def test_vehicle_only_grz(self):
+        assert self.row.vehicle == "Е 123 АВ 78"
+
+    def test_reception_clean_blocks(self):
+        r = self.row.reception
+        # Отдельные блоки, разделённые пустой строкой.
+        blocks = [b.strip() for b in r.split("\n\n") if b.strip()]
+        assert len(blocks) >= 3
+        # Компания — в первом блоке.
+        assert blocks[0].startswith("ООО")
+        assert "ГЕКСАФОРМ" in blocks[0]
+        # Есть блок с адресом погрузки, склеенным в одну строку.
+        addr = next(b for b in blocks if "Астрономическая" in b)
+        assert "198504" in addr
+        assert "Петергоф" in addr
+        assert "\n" not in addr
+        # Есть блок с датой.
+        assert any(b.strip() == "29.08.2022" for b in blocks)
+        # OCR-обрывки шаблонов не должны проходить.
+        for junk in (
+            "нанменование {ИНН", "(нанменование",
+            "инфукнструктуры", "пункта погруи",
+            "заявленные дата", "фактиесские лата",
+            "(заявленные",
+        ):
+            assert junk not in r, f"template junk {junk!r} leaked into reception"
 
 
 # ---------------------------------------------------------------------------

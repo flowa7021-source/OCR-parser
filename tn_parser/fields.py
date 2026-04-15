@@ -68,7 +68,7 @@ _WAYBILL_HEADER = re.compile(
 _SERVICE_LINE_RE = re.compile(
     r"^(?:"
     r"является\s+(?:экспедитором|грузоотправителем)"
-    r"|\(\s*реквизиты\b"
+    r"|\(?\s*рекви[сз]и[тц]\w*"           # «(реквизиты…» и OCR-вариант «Преквисит»
     r"|полное\s+наименование"
     r"|сокращ\w*\s+наименование"
     r"|наименование\s+(?:юр|лица)"
@@ -84,6 +84,9 @@ _SERVICE_LINE_RE = re.compile(
     # «по организации перевозки груза)» — хвост аннотации, часто с OCR-ошибками
     # («ло организалии пёеревозки груза)»). Признак: «организ…» + «…еревозк…».
     r"|\w*организ\w*\s+п\w*еревозк"
+    # «по организации» — обрезанный вариант той же аннотации, когда OCR не
+    # сумел продолжить. Только если строка целиком короткая (≤ 3 токенов).
+    r"|по\s+организац\w*\s*$"
     r"|[\-–—]\s+\("                       # «— (реквизиты…)» — аннотация водителя
     r"|[\[\(][\s xх×✓✔][\]\)]"   # чекбоксы
     r"|[\-–—=_\s]{3,}"            # разделители из дефисов
@@ -110,9 +113,26 @@ def _is_service_or_empty(line: str) -> bool:
     # Целиком в скобках: «(реквизиты, позволяющие…)»
     if re.match(r"^\(.+\)\s*$", s):
         return True
-    if _SERVICE_LINE_RE.match(s):
+    # Отбрасываем OCR-мусор в начале строки («| является экспедитором |||»,
+    # «___ реквизиты…»): перед проверкой снимаем все «технические» символы.
+    s_bare = re.sub(r"^[\s|_\-–—=\\/]+", "", s)
+    if _SERVICE_LINE_RE.match(s_bare):
         return True
     if _SERVICE_ANYWHERE_RE.search(s):
+        return True
+    # Хвост-пояснение «… Грузополучателя)» / «… Грузоотправителя)» с
+    # OCR-искажениями («Гручопииучателя)», «Грузоотпавителя)»): короткая
+    # строка (<80 символов) без длинного числа (ИНН/КПП/индекс) и с
+    # закрывающей скобкой в конце. По ключевым фрагментам, которые
+    # переживают даже грубый OCR: «ател»/«учат»/«равит»/«травит».
+    if (len(s) < 80
+            and s.rstrip().endswith(")")
+            and not re.search(r"\d{5,}", s)
+            and re.search(
+                r"(?:получат|пучат|учат[её]?л|отправит|равит[её]?л"
+                r"|ател[яь]|отпав\w*)\s*\)",
+                s, re.IGNORECASE,
+            )):
         return True
     return False
 
@@ -250,6 +270,13 @@ _DRIVER_NAME_RE = re.compile(
     r"\b[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ]\.\s*[А-ЯЁ]\.?", re.UNICODE
 )
 
+# Реквизиты юрлица/ИП: ООО, АО, ЗАО, ПАО, ИП и т.п. Используется и в
+# «Приёме груза» для классификации строк, и в extract_org для поиска
+# «якорной» строки при мусорном начале раздела.
+_ORG_PREFIX = re.compile(
+    r"^\s*(?:ООО|ОАО|АО|ЗАО|ПАО|ПБОЮЛ|ИП)\b", re.IGNORECASE
+)
+
 
 def extract_org(
     section_body: str,
@@ -266,13 +293,22 @@ def extract_org(
     """
     if section_body:
         lines = _meaningful_lines(section_body)
-        # Спецправило для перевозчика: если «Самовывоз» на отдельной строке
-        # и при этом в разделе есть отдельно ФИО водителя — фактический
-        # «перевозчик» — это водитель (у самовывоза нет юрлица-перевозчика).
+
+        # Перевозчик: по смыслу документа — это водитель (особенно в
+        # двухколоночном макете, где слева юрлицо, а справа ФИО). Если ФИО
+        # находим — возвращаем только его.
         if fallback_kw == "перевозчик":
-            has_driver = any(_DRIVER_NAME_RE.search(ln) for ln in lines)
-            if has_driver:
-                lines = [ln for ln in lines if not _SAMOVYVOZ_RE.match(ln)]
+            driver = _extract_driver_fio(lines)
+            if driver:
+                return driver, 0.95
+
+        # Склейка «висячего» ярлыка без значения с последующим числом:
+        # «…, ИНН 7707820890, КПП» + «770701001» → «…, ИНН 7707820890,
+        # КПП 770701001». Без этой склейки получаем «КПП, 770701001»
+        # (число становится отдельным элементом через «, » в join) — это
+        # визуально неправильно и ломает поиск.
+        lines = _glue_dangling_labels(lines)
+
         if lines:
             joined = ", ".join(ln.rstrip(",") for ln in lines[:max_lines])
             joined = joined[:max_len].strip(" ,;")
@@ -286,22 +322,128 @@ def extract_org(
                 joined,
                 flags=re.IGNORECASE,
             ).rstrip(" ,;")
+            # Снимаем хвост-пояснение с OCR-искажённым «Грузоотправителя» /
+            # «Грузополучателя» (вплоть до близких по символам вариантов:
+            # «Гручопииучателя», «Грузоотпавителя»). Признак — начинается
+            # с буквы «Г», содержит «руз», «получател» или «отправител» и
+            # заканчивается «)».
+            joined = re.sub(
+                r"[,;]?\s*\w*реквизит\w*[^)]{0,80}\)\s*$", "", joined,
+                flags=re.IGNORECASE,
+            )
+            joined = re.sub(
+                r"[,;]?\s*\w*[ГT]р?уч?оп?[о1](?:о)?получат\w*\)?\s*$", "",
+                joined, flags=re.IGNORECASE,
+            )
+            joined = re.sub(
+                r"[,;]?\s*\w*[ГT]р?уч?оп?[о1](?:о)?отправител\w*\)?\s*$", "",
+                joined, flags=re.IGNORECASE,
+            )
+            joined = joined.rstrip(" ,;")
             if joined and not is_garbage(joined):
                 return joined, 0.9
 
     if full_text and fallback_kw:
+        # Расширенный фоллбэк: после заголовка берём до 4 непустых строк
+        # и из них уже выбираем первую, которая начинается с юридической
+        # формы (ООО/АО/ИП/ПАО…) или содержит ИНН — остальное считаем
+        # шумом-подписью. Это особенно важно для макетов, где сам
+        # «Грузоотправитель» выведен мелким шрифтом, и настоящие реквизиты
+        # стоят на две-три строки ниже заголовка.
         pat = re.compile(
-            rf"{fallback_kw}\s*[:\-–—]?\s*\n?\s*([^\n\r]{{2,350}})",
+            rf"{fallback_kw}\s*[:\-–—]?\s*\n?\s*((?:[^\n\r]*\n?){{1,8}})",
             re.IGNORECASE,
         )
         m = pat.search(full_text)
         if m:
-            candidate = m.group(1).strip()
-            if (candidate and not is_garbage(candidate)
-                    and not _SERVICE_LINE_RE.match(candidate)):
-                return candidate, 0.5
+            chunk = m.group(1)
+            cand_lines = _meaningful_lines(chunk)
+            if fallback_kw == "перевозчик":
+                driver = _extract_driver_fio(cand_lines)
+                if driver:
+                    return driver, 0.6
+            # Ищем первую «якорную» строку — с юр-формой или ИНН.
+            for i, ln in enumerate(cand_lines):
+                if (_ORG_PREFIX.match(ln)
+                        or re.search(r"\bИНН\s*\d{9,12}\b", ln, re.IGNORECASE)):
+                    anchor = cand_lines[i:i + max_lines]
+                    anchor = _glue_dangling_labels(anchor)
+                    joined = ", ".join(ln.rstrip(",") for ln in anchor)[:max_len]
+                    joined = joined.strip(" ,;")
+                    if joined and not is_garbage(joined):
+                        return joined, 0.6
+            # Если якоря нет — отдаём первую осмысленную строку (старая логика).
+            if cand_lines:
+                candidate = cand_lines[0][:max_len]
+                if candidate and not is_garbage(candidate):
+                    return candidate, 0.5
 
     return MISSING, 0.0
+
+
+def _glue_dangling_labels(lines: List[str]) -> List[str]:
+    """«…, КПП» + «770701001» → «…, КПП 770701001».
+
+    Склеивает строку, которая заканчивается на голый ярлык реквизитов
+    (ИНН/КПП/ОГРН/ОКПО/БИК), со следующей, если та начинается с цифр.
+    """
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        cur = lines[i].rstrip(" ,;")
+        if (i + 1 < len(lines)
+                and re.search(
+                    r"\b(?:ИНН|КПП|ОГРН|ОКПО|БИК)\s*$", cur, re.IGNORECASE)
+                and re.match(r"\s*\d", lines[i + 1])):
+            cur = cur.rstrip() + " " + lines[i + 1].strip()
+            i += 1
+        out.append(cur)
+        i += 1
+    return out
+
+
+# ФИО водителя для раздела «Перевозчик». Ищется в любом месте строки
+# (в реальных OCR-дампах часто перед ФИО стоит мусор «/ Й /», «— »).
+_FIO_FULL_RE = re.compile(
+    # OCR часто приклеивает к ФИО следующий токен без пробела
+    # («Николаевич2203», «АлександровичПаспорт»), поэтому вместо \b
+    # ограничение конца — «не сразу строчная русская буква», чтобы не
+    # задеть середину длинного слова.
+    r"([А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)(?![а-яё])"
+)
+_FIO_ABBR_RE = re.compile(
+    r"\b([А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ]\.\s*[А-ЯЁ]\.?)(?!\s*[а-яё])"
+)
+
+
+def _extract_driver_fio(lines: List[str]) -> Optional[str]:
+    """Находит ФИО водителя в списке строк раздела «Перевозчик».
+
+    Предпочтение: «Фамилия Имя Отчество» (3 слова) > «Фамилия И.О.».
+    Возвращает None, если явного ФИО не видно (тогда вызывающий код
+    падает на извлечение юрлица-перевозчика — редкий кейс, когда ФИО
+    в разделе вовсе нет).
+    """
+    # 1) Полная форма «Фамилия Имя Отчество».
+    for ln in lines:
+        # В левом столбце могут стоять «ООО», «ПАО» — их пропускаем.
+        if _ORG_PREFIX.match(ln):
+            continue
+        m = _FIO_FULL_RE.search(ln)
+        if m:
+            return m.group(1)
+    # 2) Сокращённая форма «Фамилия И.О.».
+    for ln in lines:
+        if _ORG_PREFIX.match(ln):
+            continue
+        m = _FIO_ABBR_RE.search(ln)
+        if m:
+            val = m.group(1).rstrip()
+            # Гарантируем вторую точку: «В.К» → «В.К.».
+            if val.count(".") == 1:
+                val += "."
+            return val
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -397,8 +539,28 @@ def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
             cleaned.append(ln)
 
         if cleaned:
-            joined = " ".join(cleaned[:3])
-            joined = joined[:400].strip(" ,;")
+            # Нумерованные позиции «1. …», «2. …», «3. …» в накладных
+            # встречаются двумя способами: (а) отдельными строками,
+            # (б) слитно одной строкой из-за плотного OCR («… 6,146 2.
+            # Одноосная …»). Ищем маркеры «N.» в любом месте каждой
+            # строки — если их два и больше, раскладываем позиции по
+            # отдельным строкам для читаемости в Excel.
+            _NUM_ITEM = re.compile(r"(?<!\d)\d+[.)]\s+[А-ЯЁA-Zа-яёa-z]")
+            total_numbered = sum(
+                len(_NUM_ITEM.findall(ln)) for ln in cleaned
+            )
+            if total_numbered >= 2:
+                split_cleaned: List[str] = []
+                for ln in cleaned:
+                    # Разрыв перед каждой следующей «N. Слово» внутри строки.
+                    parts = re.split(
+                        r"(?<=\S)\s+(?=\d+[.)]\s+[А-ЯЁA-Zа-яёa-z])", ln
+                    )
+                    split_cleaned.extend(p.strip() for p in parts if p.strip())
+                joined = "\n".join(split_cleaned[:15])[:1500].strip(" ,;")
+            else:
+                joined = " ".join(cleaned[:3])
+                joined = joined[:400].strip(" ,;")
             if joined and not is_garbage(joined):
                 return joined, 0.9
 
@@ -573,6 +735,32 @@ def _looks_noisy(line: str) -> bool:
     # Они пропускаются, т.к. содержат реальные русские слова, но нам не нужны.
     if re.match(r"^\s*\(.+\)\s*$", s):
         return True
+    # Начатая, но не закрытая аннотация формы: «(заявленные дата н время
+    # подачи транс средетва под по», «(нанменование {ИНН владен».
+    # Такие обрывки — чистая разметка бланка, данных в них нет.
+    if re.match(r"^\s*\(", s) and ")" not in s:
+        return True
+    # Шаблонные фразы бланка из раздела «Приём груза» — в любом месте
+    # строки, поскольку OCR часто режет их по середине.
+    _RECEPTION_TEMPLATE_KW = (
+        "инфраструктур", "инструктур",              # «владельца инфраструктуры»
+        "пункта погруз", "пункта погруи",           # «пункта погрузки»
+        "наименование (инн", "нанменование {инн",   # OCR-варианты
+        "владел\u044cца объекта",                  # «владельца объекта»
+        "заявленные дата", "заявленные лата",
+        "фактические дата", "фактиесские лата",
+        "время прибытия под",
+        "время убытия",
+        "опломбирован",
+        "расшифровка подписи",
+        "осуществившего погрузку",
+        "полномочия лица",
+        "принявшего груз",
+    )
+    low = s.lower()
+    for kw in _RECEPTION_TEMPLATE_KW:
+        if kw in low:
+            return True
     # Украинские буквы/диакритика/встроенные апострофы по токенам.
     if is_noise_line(s):
         return True
@@ -610,10 +798,15 @@ _ADDRESS_TOPONYM = re.compile(
     r"^\s*(?:д\.|г\.|с\.|пос\.|п\.|обл\.|с/п|с-п|р-н|ул\.|пр\.|пр-т|пер\.|ш\.)",
     re.IGNORECASE,
 )
-# Реквизиты юрлица/ИП: ООО, АО, ЗАО, ПАО, ИП и т.п.
-_ORG_PREFIX = re.compile(
-    r"^\s*(?:ООО|ОАО|АО|ЗАО|ПАО|ПБОЮЛ|ИП)\b", re.IGNORECASE
+# Признак «продолжения» адреса: название улицы/дома/корпуса в любом месте
+# строки. Нужен, когда OCR вывел «Астрономическая ул, дом № 8, корпус 2»
+# отдельной строкой без стартового «ул.»/«г.».
+_ADDRESS_CONTINUATION = re.compile(
+    r"\b(?:ул\.?|пр\.?|пр-т|пер\.?|ш\.?|дом\b|корпус\b|литер\b|стр\.?|каб\.?|"
+    r"пом\.?|оф(?:ис)?\.?|этаж\b)",
+    re.IGNORECASE,
 )
+# _ORG_PREFIX определён выше, у extract_org — переиспользуем.
 _DATE_ONLY = re.compile(r"^\s*\d{2}\.\d{2}\.\d{4}\s*$")
 
 
@@ -625,6 +818,11 @@ def _line_kind(line: str) -> str:
     if _ORG_PREFIX.match(s):
         return "org"
     if _ADDRESS_POSTCODE.match(s) or _ADDRESS_TOPONYM.match(s):
+        return "address"
+    # «Продолжение» адреса без стартового маркера: «Астрономическая ул,
+    # дом № 8, корпус 2, литер Д». Признак — маркер «ул./дом/корпус/…»
+    # в любом месте и нет длинного числа-идентификатора (не ИНН/КПП/тел.).
+    if _ADDRESS_CONTINUATION.search(s) and not re.search(r"\d{7,}", s):
         return "address"
     return "other"
 
@@ -654,12 +852,14 @@ def _merge_address_fragments(lines: List[str]) -> List[str]:
                 continue
 
         # «141411, …, с/п …, р-н …,» без населённого пункта, а следующая
-        # строка — топоним «д. …»: обычный прямой порядок.
+        # строка — топоним или улица/дом-корпус: обычный прямой порядок.
         if (cur_kind == "address"
                 and _ADDRESS_POSTCODE.match(cur)
                 and i + 1 < len(lines)):
             nxt = lines[i + 1].strip()
-            if _ADDRESS_TOPONYM.match(nxt) and not _ADDRESS_POSTCODE.match(nxt):
+            nxt_kind = _line_kind(nxt)
+            if (nxt_kind == "address"
+                    and not _ADDRESS_POSTCODE.match(nxt)):
                 cur_clean = cur.rstrip(",; ")
                 out.append(f"{cur_clean}, {nxt}".rstrip(",; "))
                 i += 2
