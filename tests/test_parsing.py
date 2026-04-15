@@ -36,6 +36,10 @@ class TestStandardWaybill:
     def test_cargo(self):
         assert "Мука" in self.row.cargo
 
+    def test_volume(self):
+        assert "10 000" in self.row.volume or "10000" in self.row.volume.replace(" ", "")
+        assert "кг" in self.row.volume.lower() or "брутто" in self.row.volume.lower()
+
     def test_carrier(self):
         assert "Быстрые Перевозки" in self.row.carrier
 
@@ -145,7 +149,6 @@ class TestOcrTabularLayout:
     def test_cargo_strips_prefix(self):
         assert self.row.cargo.startswith("Блок облицовочный")
         assert "Наименование" not in self.row.cargo
-        assert "1." not in self.row.cargo[:5]
 
     def test_carrier_combines_two_columns(self):
         # Две колонки: «Самовывоз» + «Рябов В.К.».

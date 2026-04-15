@@ -65,7 +65,7 @@ class TestExcel:
         wb = load_workbook(out)
         ws = wb.active
         # Колонка confidence — 13-я.
-        assert ws.cell(row=2, column=13).value == 93  # high ≈ 0.925 → 93%
+        assert ws.cell(row=2, column=13).value == 93  # sum=7.4, /8=0.925, FP→0.93→93%
         assert ws.cell(row=3, column=13).value == 0   # low
         assert ws.cell(row=4, column=13).value == 0   # err
 

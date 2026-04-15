@@ -31,9 +31,10 @@ def test_real_sample_numbering_variant():
     sec = split_sections(_load("tn_real_7145B.txt"))
     assert "Бекам" in sec["shipper"]
     assert "Моспроект" in sec["consignee"]
-    assert "Блок облицовочный" in sec["cargo"] or "Наименование" in sec["cargo"]
+    assert "Блок облицовочный" in sec["cargo"]
     assert "Самовывоз" in sec["carrier"]
-    assert "RENAULT" in sec["vehicle"] or "Р 814" in sec["vehicle"]
+    assert "RENAULT" in sec["vehicle"]
+    assert "Р 814" in sec["vehicle"]
     assert "Подолино" in sec["reception"]
     # Следующие разделы не должны утекать в приём груза.
     assert "Переадресовка" not in sec["reception"]
