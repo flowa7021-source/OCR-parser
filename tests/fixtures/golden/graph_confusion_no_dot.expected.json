@@ -1,0 +1,31 @@
+{
+  "rows": [
+    {
+      "number": "GC-2024-017",
+      "date": "02.02.2024",
+      "shipper": {
+        "contains": ["Первый Контрагент", "1655111122"]
+      },
+      "consignee": {
+        "contains": ["Второй Контрагент", "1655333344"]
+      },
+      "cargo": {
+        "contains": ["Картон"],
+        "not_contains": ["Захаров", "Перевозчик"]
+      },
+      "carrier": {
+        "contains": ["Захаров", "165700998877"],
+        "not_contains": ["VOLVO", "В 404", "Транспортное средство"]
+      },
+      "vehicle": {
+        "contains": ["VOLVO", "В 404 КМ 716"],
+        "not_contains": ["Приём", "Баумана"]
+      },
+      "reception": {
+        "contains": ["Баумана", "02.02.2024"],
+        "not_contains": ["Переадресовка", "Выдача груза"]
+      },
+      "note_not_contains": ["ERROR"]
+    }
+  ]
+}
