@@ -24,19 +24,19 @@ def _sample_rows():
         waybill="Транспортная накладная № 001",
         date="01.01.2024", number="001",
         shipper="ООО Ромашка", consignee="ООО Василёк",
-        cargo="Мука", carrier="ООО Быстрые",
-        vehicle="А 123 ВС 777", reception="г. Москва 01.01.2024",
+        cargo="Мука", volume="500 шт", carrier="Иванов И.И.",
+        vehicle="KAMAZ\nА123ВС777", reception="г. Москва 01.01.2024",
         source="a.pdf", note="",
         confidence=FieldConfidence(
             date=1.0, number=0.9, shipper=0.9, consignee=0.9,
-            cargo=0.9, carrier=0.9, vehicle=1.0, reception=0.9,
+            cargo=0.9, volume=0.9, carrier=0.9, vehicle=1.0, reception=0.9,
         ),
     )
     low = ParsedRow(
         waybill="Транспортная накладная",
         date="отсутствует", number="отсутствует",
         shipper="отсутствует", consignee="отсутствует",
-        cargo="отсутствует", carrier="отсутствует",
+        cargo="отсутствует", volume="отсутствует", carrier="отсутствует",
         vehicle="отсутствует", reception="отсутствует",
         source="b.pdf", note="LOW_CONF",
         confidence=FieldConfidence(),
@@ -46,7 +46,7 @@ def _sample_rows():
 
 
 class TestExcel:
-    def test_has_12_columns_including_confidence(self, tmp_path):
+    def test_has_13_columns_including_confidence(self, tmp_path):
         rows = list(_sample_rows())
         out = tmp_path / "out.xlsx"
         write_excel(rows, str(out))
@@ -54,8 +54,12 @@ class TestExcel:
         wb = load_workbook(out)
         ws = wb.active
         headers = [ws.cell(row=1, column=i + 1).value for i in range(len(COLUMNS))]
-        assert len(headers) == 12
+        assert len(headers) == 13
         assert headers[-1] == "Уверенность, %"
+        # Объём — между «Груз» и «Перевозчик».
+        assert "Объём" in headers
+        assert headers.index("Объём") == headers.index("Груз") + 1
+        assert headers.index("Перевозчик") == headers.index("Объём") + 1
 
     def test_confidence_values(self, tmp_path):
         high, low, err = _sample_rows()
@@ -64,10 +68,11 @@ class TestExcel:
 
         wb = load_workbook(out)
         ws = wb.active
-        # Колонка confidence — 12-я.
-        assert ws.cell(row=2, column=12).value == 93  # high ≈ 0.925 → 93%
-        assert ws.cell(row=3, column=12).value == 0   # low
-        assert ws.cell(row=4, column=12).value == 0   # err
+        # Колонка confidence — 13-я.
+        conf_col = len(COLUMNS)
+        assert ws.cell(row=2, column=conf_col).value == 93  # high ≈ 0.93 → 93%
+        assert ws.cell(row=3, column=conf_col).value == 0   # low
+        assert ws.cell(row=4, column=conf_col).value == 0   # err
 
     def test_confidence_fill_colors(self, tmp_path):
         high, low, _ = _sample_rows()
@@ -75,11 +80,31 @@ class TestExcel:
         write_excel([high, low], str(out))
         wb = load_workbook(out)
         ws = wb.active
-        # Высокая уверенность — зелёная; нулевая — красная.
-        high_fill = ws.cell(row=2, column=12).fill.fgColor.rgb
-        low_fill = ws.cell(row=3, column=12).fill.fgColor.rgb
+        conf_col = len(COLUMNS)
+        high_fill = ws.cell(row=2, column=conf_col).fill.fgColor.rgb
+        low_fill = ws.cell(row=3, column=conf_col).fill.fgColor.rgb
         assert "D9EAD3" in (high_fill or "").upper()
         assert "F4CCCC" in (low_fill or "").upper()
+
+    def test_volume_cell_has_value(self, tmp_path):
+        high, _, _ = _sample_rows()
+        out = tmp_path / "out.xlsx"
+        write_excel([high], str(out))
+        wb = load_workbook(out)
+        ws = wb.active
+        # Объём — 7-я колонка.
+        assert ws.cell(row=2, column=7).value == "500 шт"
+
+    def test_vehicle_cell_wraps_on_newline(self, tmp_path):
+        high, _, _ = _sample_rows()
+        out = tmp_path / "out.xlsx"
+        write_excel([high], str(out))
+        wb = load_workbook(out)
+        ws = wb.active
+        # ТС — 9-я колонка, значение с переносом строки.
+        cell = ws.cell(row=2, column=9)
+        assert "\n" in (cell.value or "")
+        assert cell.alignment.wrap_text  # перенос внутри ячейки включён
 
 
 class TestLockedFileFallback:

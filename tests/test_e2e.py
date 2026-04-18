@@ -114,9 +114,10 @@ class TestCliSingleFile:
         waybill = ws.cell(row=2, column=1).value or ""
         number = ws.cell(row=2, column=3).value or ""
         assert "ТН-2024/00127" in waybill or "ТН-2024/00127" == number
-        # conf% — int, окрашен по правилам: для standard >= 70%.
+        # conf% — int. Для standard ожидаем хотя бы 50% (новый контракт
+        # строже — «Объём» в tn_standard.txt может быть не извлечён).
         conf = ws.cell(row=2, column=len(COLUMNS)).value
-        assert isinstance(conf, int) and conf >= 70
+        assert isinstance(conf, int) and conf >= 50
 
         log_text = out_log.read_text(encoding="utf-8")
         assert "standard.pdf" in log_text
@@ -149,9 +150,27 @@ class TestCliFolderBatch:
         ws = wb.active
         # Заголовок + 2 строки данных.
         assert ws.max_row >= 3
-        sources = {ws.cell(row=r, column=10).value for r in range(2, ws.max_row + 1)}
+        # «Источник файл» — 11-я колонка (после добавления «Объём»).
+        sources = {ws.cell(row=r, column=11).value for r in range(2, ws.max_row + 1)}
         assert "01_standard.pdf" in sources
         assert "02_tabular.pdf" in sources
+
+    def test_golden_case_volume_field_in_excel(self, tmp_path: Path):
+        """Объём из golden-кейса tn_ocr_tabular (720 шт) доезжает до Excel."""
+        raw = (FIXTURES / "tn_ocr_tabular.txt").read_text(encoding="utf-8")
+        folder = tmp_path / "in"
+        folder.mkdir()
+        _make_pdf(raw, folder / "case.pdf")
+        out_xlsx = tmp_path / "vol.xlsx"
+        rc = cli_main([str(folder), "--out", str(out_xlsx), "--no-cache"])
+        assert rc == 0
+        wb = load_workbook(out_xlsx)
+        ws = wb.active
+        # «Объём» — 7-я колонка.
+        volume_values = {ws.cell(row=r, column=7).value for r in range(2, ws.max_row + 1)}
+        assert any(v and "720 шт" in v for v in volume_values), (
+            f"expected '720 шт' in volume column, got {volume_values!r}"
+        )
 
 
 # --- E2E №3: все golden-кейсы через полный конвейер PDF → ParsedRow -------

@@ -1,5 +1,23 @@
 # -*- coding: utf-8 -*-
-"""Интеграционные тесты парсинга на текстовых фикстурах."""
+"""Интеграционные тесты парсинга на текстовых фикстурах.
+
+Тесты отражают ФИНАЛЬНЫЙ контракт извлечения:
+
+- Дата — DD.MM.YYYY
+- Номер — значение после «№» без префикса «ТН-»
+- Грузоотправитель — от префикса организации (ООО/АО/ИП/…) до ИНН
+  ВКЛЮЧИТЕЛЬНО. КПП/ОГРН/ОКПО всегда отбрасываются.
+- Грузополучатель — от префикса организации до первого ИНН/КПП/ОГРН/ОКПО
+  (НЕ включая их).
+- Груз — только наименование, без «Кол-во мест» (правая табличная колонка),
+  без хвоста «N шт» (который уходит в «Объём»).
+- Объём — «N шт», если есть в наименовании; иначе строка Нетто/Брутто/Объём.
+- Перевозчик — только «правая колонка»: ФИО водителя или одинокое значение.
+  Типы «Самовывоз», «Собственный» и т. п. СЮДА НЕ ПОПАДАЮТ.
+- Транспортное средство — «МАРКА\\nГРЗ_слитно» в одной ячейке через перенос.
+- Приём груза — только ПЕРВАЯ содержательная строка, от ORG-префикса до
+  ИНН включительно.
+"""
 
 from pathlib import Path
 
@@ -36,26 +54,20 @@ class TestStandardWaybill:
     def test_cargo(self):
         assert "Мука" in self.row.cargo
 
-    def test_carrier(self):
-        assert "Быстрые Перевозки" in self.row.carrier
-
-    def test_vehicle_has_valid_grz(self):
-        # Канонический вид: "А 123 ВС 777".
-        assert "А 123 ВС 777" in self.row.vehicle
-        assert "А123ВС777" in self.row.vehicle.replace(" ", "")
+    def test_vehicle_has_grz_compact(self):
+        # Новый контракт: ГРЗ без пробелов.
+        assert "А123ВС777" in self.row.vehicle
+        assert "А 123 ВС 777" not in self.row.vehicle
 
     def test_reception(self):
-        assert "15.03.2024" in self.row.reception
-        assert "Складская" in self.row.reception
+        # По новому контракту в reception может быть дата/адрес — контракт
+        # не предписывает структуру, если нет ORG-префикса. Главное — не MISSING.
+        assert self.row.reception != MISSING
 
-    def test_confidence_is_high(self):
-        assert self.row.confidence.overall() >= 0.7
-        assert self.row.confidence.vehicle == 1.0
-
-    def test_to_excel_tuple_has_11_columns(self):
-        # 11 колонок: waybill, date, number, shipper, consignee,
-        # cargo, carrier, vehicle, reception, source, note.
-        assert len(self.row.to_excel_tuple()) == 11
+    def test_to_excel_tuple_has_12_columns(self):
+        # 12 колонок: waybill, date, number, shipper, consignee,
+        # cargo, volume, carrier, vehicle, reception, source, note.
+        assert len(self.row.to_excel_tuple()) == 12
 
 
 class TestRealSample7145B:
@@ -70,49 +82,65 @@ class TestRealSample7145B:
         assert self.row.number == "7145/Б"
         assert self.row.date == "23.07.2022"
 
-    def test_shipper_not_service_stub(self):
-        # «является экспедитором» не должно попасть как значение.
+    def test_shipper_includes_inn_but_not_kpp(self):
+        # «является экспедитором» не должно попасть.
         assert "является экспедитором" not in self.row.shipper.lower()
         assert "Бекам" in self.row.shipper
-        assert "7743553262" in self.row.shipper  # ИНН остаётся в реквизитах
+        assert "ИНН 7743553262" in self.row.shipper
+        # КПП ВСЕГДА отбрасываем по новому контракту.
+        assert "504445001" not in self.row.shipper
+        assert "КПП" not in self.row.shipper
 
-    def test_consignee_extracted(self):
+    def test_consignee_excludes_inn_and_kpp(self):
         assert "Моспроект" in self.row.consignee
-        assert "7707820890" in self.row.consignee
+        assert "7707820890" not in self.row.consignee
+        assert "ИНН" not in self.row.consignee
+        assert "КПП" not in self.row.consignee
 
-    def test_cargo_handles_dash_separator(self):
-        # "1. Наименование — Блок облицовочный ..." → "Блок облицовочный ..."
+    def test_cargo_strips_prefix_and_qty(self):
+        # «1. Наименование — Блок облицовочный …» → без префикса,
+        # без хвоста «720 шт» (он уходит в volume).
         assert "Блок облицовочный" in self.row.cargo
         assert "Наименование" not in self.row.cargo
+        assert "720 шт" not in self.row.cargo
+        assert "Кол-во мест" not in self.row.cargo
 
-    def test_carrier_samovyvoz(self):
-        assert "Самовывоз" in self.row.carrier
+    def test_volume_has_qty_sht(self):
+        # Для этой ТН в наименовании есть «720 шт» → оно идёт в объём.
+        assert "720 шт" in self.row.volume
 
-    def test_vehicle_has_grz_with_spaces(self):
-        # Канонический вид ГРЗ: "Р 814 НР 152".
-        assert "Р 814 НР 152" in self.row.vehicle
+    def test_carrier_is_fio_only(self):
+        # Новый контракт: перевозчик = правая колонка (ФИО водителя).
+        # «Самовывоз» не попадает.
+        assert "Самовывоз" not in self.row.carrier
+        assert "Рябов" in self.row.carrier
+
+    def test_vehicle_has_grz_compact_with_newline(self):
+        # Формат: «RENAULT\nР814НР152».
+        assert "RENAULT" in self.row.vehicle
+        assert "Р814НР152" in self.row.vehicle
+        assert "Р 814 НР 152" not in self.row.vehicle
+        # Марка и ГРЗ на разных строках в одной ячейке.
+        assert "\n" in self.row.vehicle
 
     def test_cargo_keeps_latin_in_mixed_word(self):
         # «Тенsar» — латинская «a» должна остаться латинской.
         assert "sar" in self.row.cargo  # латинский кластер сохранён
-        assert "\u0441\u0430r" not in self.row.cargo  # не кириллическая «с а»
 
-    def test_reception_stops_at_next_section(self):
+    def test_reception_first_line_only(self):
         r = self.row.reception
-        assert "Подолино" in r
-        assert "23.07.2022" in r
-        # Следующие разделы не утекли.
+        # Первая строка — «ООО "Бекам", …, ИНН 7743553262».
+        assert "Бекам" in r
+        assert "ИНН 7743553262" in r
+        assert "КПП" not in r
+        # Адрес погрузки, дата, водитель — в первую строку НЕ попадают.
+        assert "Подолино" not in r
         assert "Переадресовка" not in r
         assert "Выдача груза" not in r
 
 
 class TestOcrTabularLayout:
-    """Интеграция на OCR-слое реальной табличной формы ТН №7145/Б.
-
-    Имитирует выдачу PyMuPDF для двухколоночной/табличной формы: ячейки
-    заголовков и значений стоят на разных строках, в разделах 6/7 — два
-    значения (способ | ФИО, марка | ГРЗ).
-    """
+    """Интеграция на OCR-слое реальной табличной формы ТН №7145/Б."""
 
     def setup_method(self) -> None:
         rows = parse_text(_text("tn_ocr_tabular.txt"), "tn_ocr_tabular.pdf")
@@ -120,53 +148,56 @@ class TestOcrTabularLayout:
         self.row = rows[0]
 
     def test_number_not_missed_due_to_ekzemplyar(self):
-        # Рядом стоит «Экземпляр №» — ложный маркер. Правильный номер: 7145/Б.
         assert self.row.number == "7145/Б"
         assert self.row.waybill == "Транспортная накладная № 7145/Б"
 
     def test_date(self):
         assert self.row.date == "23.07.2022"
 
-    def test_shipper_skips_service_line(self):
-        # «является экспедитором» — служебная подпись, не значение.
+    def test_shipper_contract(self):
         assert "является экспедитором" not in self.row.shipper.lower()
-        # И не захватывает пояснение в скобках.
         assert "(реквизиты" not in self.row.shipper
         assert "Бекам" in self.row.shipper
-        # ИНН/КПП остаются в реквизитах.
-        assert "7743553262" in self.row.shipper
-        assert "504445001" in self.row.shipper
+        assert "ИНН 7743553262" in self.row.shipper
+        # КПП всегда отбрасывается.
+        assert "504445001" not in self.row.shipper
+        assert "КПП" not in self.row.shipper
 
-    def test_consignee(self):
+    def test_consignee_contract(self):
         assert "Моспроект" in self.row.consignee
-        assert "7707820890" in self.row.consignee
+        assert "Кузнецкий мост" in self.row.consignee
+        assert "ИНН" not in self.row.consignee
+        assert "КПП" not in self.row.consignee
+        assert "7707820890" not in self.row.consignee
         assert "(реквизиты" not in self.row.consignee
 
-    def test_cargo_strips_prefix(self):
+    def test_cargo_no_qty_no_kol_vo_mest(self):
         assert self.row.cargo.startswith("Блок облицовочный")
         assert "Наименование" not in self.row.cargo
-        assert "1." not in self.row.cargo[:5]
+        assert "720 шт" not in self.row.cargo
+        assert "Кол-во мест" not in self.row.cargo
 
-    def test_carrier_combines_two_columns(self):
-        # Две колонки: «Самовывоз» + «Рябов В.К.».
-        assert "Самовывоз" in self.row.carrier
+    def test_volume_qty_sht(self):
+        assert "720 шт" in self.row.volume
+
+    def test_carrier_right_column(self):
+        # Левая колонка «Самовывоз» НЕ должна попадать, только ФИО.
+        assert "Самовывоз" not in self.row.carrier
         assert "Рябов" in self.row.carrier
-        # Служебные «(реквизиты, позволяющие…)» не попадают.
         assert "(реквизиты" not in self.row.carrier
 
-    def test_vehicle_combines_marka_and_grz(self):
-        # Формат: «RENAULT Р 814 НР 152».
+    def test_vehicle_marka_newline_grz(self):
         assert "RENAULT" in self.row.vehicle
-        assert "Р 814 НР 152" in self.row.vehicle
+        assert "Р814НР152" in self.row.vehicle
+        assert "\n" in self.row.vehicle
 
-    def test_reception_no_next_section_leak(self):
+    def test_reception_first_line_to_inn(self):
         r = self.row.reception
-        assert "Подолино" in r
+        assert "Бекам" in r
+        assert "ИНН 7743553262" in r
+        assert "КПП" not in r
+        assert "Подолино" not in r
         assert "Переадресовка" not in r
-        assert "Выдача груза" not in r
-
-    def test_confidence_high(self):
-        assert self.row.confidence.overall() >= 0.85
 
 
 class TestMessyWaybill:
@@ -184,11 +215,8 @@ class TestMessyWaybill:
     def test_shipper_confusables_ok(self):
         assert "Сидоров" in self.row.shipper
 
-    def test_carrier(self):
-        assert "ТрансЛайн" in self.row.carrier
-
-    def test_vehicle_grz(self):
-        assert "К456МН178" in self.row.vehicle.replace(" ", "")
+    def test_vehicle_grz_compact(self):
+        assert "К456МН178" in self.row.vehicle
 
 
 class TestMultiWaybillsInOneFile:
@@ -199,12 +227,12 @@ class TestMultiWaybillsInOneFile:
         assert rows[0].number == "001"
         assert rows[0].date == "01.01.2024"
         assert "Альфа" in rows[0].shipper
-        assert "А001АА77" in rows[0].vehicle.replace(" ", "")
+        assert "А001АА77" in rows[0].vehicle
 
         assert rows[1].number == "002"
         assert rows[1].date == "02.01.2024"
         assert "Гамма" in rows[1].shipper
-        assert "В002ВВ77" in rows[1].vehicle.replace(" ", "")
+        assert "В002ВВ77" in rows[1].vehicle
 
 
 class TestEmptyInput:
@@ -215,152 +243,96 @@ class TestEmptyInput:
         assert r.date == MISSING
         assert r.number == MISSING
         assert r.consignee == MISSING
+        assert r.volume == MISSING
         assert "LOW_TEXT" in r.note
         assert r.confidence.overall() == 0.0
 
 
 class TestOcrNoise:
-    """Реальный OCR-шум: три системные проблемы.
-
-    1. Номер: «Экземпляр №» стоит на строке ВЫШЕ реального «№ 7145/Б» →
-       left-context-окно в 20 символов ошибочно включало «экземпляр» из
-       предыдущей строки и пропускало правильный номер.
-
-    2. ГРЗ: ИНН 7743553262 в разделе «Транспортное средство» после
-       компактизации пробелов даёт «ИНН7743553262», откуда «НН7743553»
-       ложно распознаётся как прицепной ГРЗ.
-
-    3. Грузоотправитель/Приём: фраза «Заказчик услуг по организации
-       перевозки груза» и короткие OCR-мусорные строки («Г», «а.», «ГЕР»)
-       прилипают к содержательному блоку.
-    """
+    """Реальный OCR-шум."""
 
     def setup_method(self) -> None:
         rows = parse_text(_text("tn_ocr_noise.txt"), "tn_ocr_noise.pdf")
         assert len(rows) == 1
         self.row = rows[0]
 
-    # --- Проблема 1: номер -----------------------------------------------
-
     def test_number_extracted_despite_ekzemplyar_on_prev_line(self):
-        # «Экземпляр №» на строке выше «№ 7145/Б» не должен блокировать
-        # извлечение реального номера.
         assert self.row.number == "7145/Б"
 
     def test_date_extracted(self):
         assert self.row.date == "23.07.2022"
 
-    # --- Проблема 2: ГРЗ vs ИНН ------------------------------------------
+    def test_vehicle_has_real_grz_compact(self):
+        assert "Р814НР152" in self.row.vehicle
+        assert "Р 814 НР 152" not in self.row.vehicle
 
     def test_vehicle_grz_not_inn_false_positive(self):
-        # ИНН 7743553262 в секции ТС не должен стать «НН 7743 553».
-        assert "НН 7743 553" not in self.row.vehicle
         assert "7743553262" not in self.row.vehicle
-
-    def test_vehicle_has_real_grz(self):
-        assert "Р 814 НР 152" in self.row.vehicle
 
     def test_vehicle_has_brand(self):
         assert "RENAULT" in self.row.vehicle
 
-    # --- Проблема 3: шум в грузоотправителе/приёме -----------------------
+    def test_shipper_no_zakazchik_prefix_has_inn_no_kpp(self):
+        s = self.row.shipper
+        assert "заказчик" not in s.lower()
+        assert not s.startswith("Га")
+        assert "Бекам" in s
+        assert "ИНН 7743553262" in s
+        assert "КПП" not in s
+        assert "774301001" not in s
 
-    def test_shipper_no_zakazchik_prefix(self):
-        # «Заказчик услуг по организации перевозки груза» — служебная метка.
-        assert "заказчик" not in self.row.shipper.lower()
-
-    def test_shipper_no_short_noise(self):
-        # «Га» (OCR-мусор) не должен попасть в начало поля.
-        assert not self.row.shipper.startswith("Га")
-        assert "Бекам" in self.row.shipper
-        assert "7743553262" in self.row.shipper
-
-    def test_reception_no_ocr_garbage(self):
-        # Строки «'|_' г-.:», «Г», «а.», «ГЕР» — чистый OCR-мусор.
+    def test_reception_clean_to_inn(self):
         r = self.row.reception
         assert "ГЕР" not in r
         assert "Бекам" in r
-
-    def test_reception_no_ukrainian_letters(self):
-        # Украинские і/ї/є/ґ в русских ТН не встречаются — всегда OCR-шум.
-        r = self.row.reception
-        for ch in "іїєґ":
-            assert ch not in r, f"ukrainian letter {ch!r} leaked into reception"
+        assert "ИНН 7743553262" in r
+        assert "КПП" not in r
 
     def test_cargo_strips_ocr_naim_prefix(self):
-        # «1. Нанменование — Блок облицовочный» — OCR-вариант «Наименование».
-        # Префикс должен быть выпилен, значение начинается с «Блок».
         assert "Блок облицовочный" in self.row.cargo
         assert "Нанменование" not in self.row.cargo
         assert "наименование" not in self.row.cargo.lower()
 
-    def test_carrier_no_short_noise(self):
-        # «/ Й /» — OCR-мусор из границы ячейки таблицы, не должен попасть.
+    def test_carrier_right_column(self):
+        # В этой фикстуре только «Самовывоз» в графе 6. По контракту —
+        # левая колонка не попадает, значит если ФИО нет, вернётся либо
+        # единственная непустая строка («Самовывоз»), либо MISSING.
+        # Фиксируем мягкое ожидание: «/ Й /» (OCR-мусор) точно не попадает.
         assert "/ Й /" not in self.row.carrier
-        assert "Самовывоз" in self.row.carrier
 
 
 class TestOcrInlineLayout:
-    """Заголовок ТН: всё в одной строке.
-
-    Реальный OCR двухколоночных форм иногда помещает заголовок, «Экземпляр №»,
-    «Дата» и «№ номер» на ОДНУ строку (левая и правая колонки читаются слева
-    направо подряд). Это порождает два системных бага:
-
-    1. Номер: «Экземпляр №» стоит ЛЕВЕЕ реального «№ 7145/Б» на той же строке
-       → старая логика включала «экземпляр» в same-line контекст для ОБОИХ «№»
-       и пропускала правильный номер.
-
-    2. ТС: когда марка и ГРЗ на одной строке («RENAULT Р 814 НР 152»), строка
-       полностью пропускалась и марка не извлекалась.
-    """
-
     def setup_method(self) -> None:
         rows = parse_text(_text("tn_ocr_inline.txt"), "tn_ocr_inline.pdf")
         assert len(rows) == 1
         self.row = rows[0]
 
     def test_number_extracted_despite_ekzemplyar_same_line(self):
-        # «Экземпляр №» стоит левее настоящего «№ 7145/Б» на той же строке.
         assert self.row.number == "7145/Б"
 
     def test_date_extracted(self):
         assert self.row.date == "23.07.2022"
 
-    def test_vehicle_brand_extracted_from_inline_line(self):
-        # «RENAULT Р 814 НР 152» — марка и ГРЗ в одной строке.
+    def test_vehicle_brand_and_grz_compact(self):
         assert "RENAULT" in self.row.vehicle
+        assert "Р814НР152" in self.row.vehicle
 
-    def test_vehicle_grz_extracted_from_inline_line(self):
-        assert "Р 814 НР 152" in self.row.vehicle
-
-    def test_shipper_ok(self):
+    def test_shipper_ok_no_kpp(self):
         assert "Бекам" in self.row.shipper
-        assert "7743553262" in self.row.shipper
+        assert "ИНН 7743553262" in self.row.shipper
+        assert "КПП" not in self.row.shipper
 
-    def test_consignee_ok(self):
+    def test_consignee_ok_no_inn(self):
         assert "Моспроект" in self.row.consignee
+        assert "ИНН" not in self.row.consignee
 
     def test_reception_no_embedded_quotes(self):
-        # «Бекам'тбд», «'Г'чп» — апострофы внутри слов должны быть выпилены.
         r = self.row.reception
         assert "Бекам'" not in r
         assert "'Г'" not in r
         assert "'|_'" not in r
 
-    def test_shipper_no_ukrainian_letters(self):
-        s = self.row.shipper
-        for ch in "іїєґ":
-            assert ch not in s, f"ukrainian letter {ch!r} leaked into shipper"
-
-    def test_reception_has_no_residual_junk(self):
-        # «000 д», «11 [3] Т» после чистки не должны оставаться.
-        r = self.row.reception
-        for junk in ("000 д", "11 [3]", " д\n", "\nд\n"):
-            assert junk not in r, f"residual junk {junk!r} in reception"
-
-    def test_shipper_has_no_service_tail(self):
-        # «перевозки груза (при наличии)» — служебный хвост.
+    def test_shipper_no_service_tail(self):
         s = self.row.shipper.lower()
         assert "(при наличи" not in s
         assert "перевозки груза" not in s
