@@ -51,6 +51,14 @@ _NUMBER_STICKY = re.compile(
     r"(?:№|No\.?)\s*\n?\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{0,48})",
     re.IGNORECASE,
 )
+# Терпимый к OCR-шуму между «№» и значением: «№ — |7145/Б» (форма с
+# разделительной колонкой). \n намеренно НЕ включён — перенос строки
+# означает, что значение поля пустое.
+_NUMBER_LAX = re.compile(
+    r"(?:№|No\.?)[ \t\|:\-–—_.]{0,8}"
+    r"([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{1,48})",
+    re.IGNORECASE,
+)
 
 _WAYBILL_HEADER = re.compile(
     r"транспортн(?:ая|ой)\s+накладн(?:ая|ой)", re.IGNORECASE
@@ -148,7 +156,12 @@ _ADJACENT_FIELD_CUTOFF = re.compile(
 
 # Новый контракт извлечения.
 _ORG_PREFIX_RE = re.compile(
-    r"\b(?:ООО|ОАО|АО|ЗАО|ПАО|НКО|ПБОЮЛ|ИП|ТОО|КФХ|АНО|ЧУ|ФГУП|ГУП|МУП|ФГБУ|ГБУ|НОУ|АНПО)\b",
+    r"(?:"
+    r"\b(?:ООО|ОАО|АО|ЗАО|ПАО|НКО|ПБОЮЛ|ИП|ТОО|КФХ|АНО|ЧУ|ФГУП|ГУП|МУП|ФГБУ|ГБУ|НОУ|АНПО)\b"
+    # OCR часто пишет «000» (три нуля) вместо «ООО» — опознаём только
+    # перед кавычкой или заглавной буквой, чтобы не путать с «000 руб».
+    r"|\b000(?=\s*[«\"'“”„А-ЯЁ])"
+    r")",
     re.IGNORECASE,
 )
 _INN_INCLUSIVE_RE = re.compile(r"\bИНН\s*\d{10,12}", re.IGNORECASE)
@@ -159,14 +172,17 @@ _FIO_RE = re.compile(
     r"\b[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\."
     r"|\b[А-ЯЁ]\.\s?[А-ЯЁ]\.\s+[А-ЯЁ][а-яё]+"
 )
+# OCR регулярно искажает «шт»: «нтт», «иіт», «шт.», «штт» и пр.
+# Допускаем 2–3 буквы из множества {ш, н, и, т, i, ї}, последняя — обязательно «т».
+_SHT_OCR = r"(?:шт|штт|нтт?|нт|ит|иіт|иiт|штi|штi\.?)"
 _CARGO_QTY_SHT_RE = re.compile(
-    r",?\s*\d+(?:[,.]\d+)?\s*шт\.?\s*$", re.IGNORECASE
+    rf",?\s*\d+(?:[,.]\d+)?\s*{_SHT_OCR}\.?\s*$", re.IGNORECASE
 )
 _CARGO_KOL_VO_MEST_RE = re.compile(
     r"\bкол[-\s]?во\s+мест\b|\bколичество\s+мест\b", re.IGNORECASE
 )
 _QTY_SHT_INLINE_RE = re.compile(
-    r"\b(\d+(?:[,.]\d+)?\s*шт\.?)", re.IGNORECASE
+    rf"\b(\d+(?:[,.]\d+)?\s*{_SHT_OCR}\.?)", re.IGNORECASE
 )
 _NETTO_BRUTTO_RE = re.compile(
     r"нетто[^\n]*брутто[^\n]*(?:объ[её]м|м[³3])[^\n]*", re.IGNORECASE
@@ -273,7 +289,7 @@ def extract_number_and_date(
 
     def _pick_number(region: str, base_conf: float) -> Tuple[str, float]:
         # Собираем все кандидаты и выбираем первый непустой/осмысленный.
-        for rx in (_NUMBER_STICKY, _NUMBER_AFTER_SYMBOL):
+        for rx in (_NUMBER_STICKY, _NUMBER_AFTER_SYMBOL, _NUMBER_LAX):
             for m in rx.finditer(region):
                 # Проверяем, не «Экземпляр №» ли это.
                 # Стратегия: смотрим на ближайшие 20 символов слева, но НЕ
@@ -285,9 +301,19 @@ def extract_number_and_date(
                 #      «экземпляр» не попадает в окно.
                 line_start = region.rfind("\n", 0, m.start())
                 line_start = 0 if line_start < 0 else line_start + 1
+                # Узкое окно (20 симв.) — для коротких маркеров, чтобы
+                # «Экземпляр №  Дата 23.07.2022  № 7145/Б» на одной строке
+                # не блокировал второй (настоящий) № по слову «экземпляр».
                 near_start = max(line_start, m.start() - 20)
                 near_ctx = region[near_start: m.start()].lower()
                 if "экземпляр" in near_ctx or "экз." in near_ctx:
+                    continue
+                # Полное начало строки — для длинных заголовков
+                # («Приложение No 4», «Постановление Правительства», «Договор No …»).
+                line_ctx = region[line_start: m.start()].lower()
+                if ("приложение" in line_ctx or "прил." in line_ctx
+                        or "постановлен" in line_ctx or "договор" in line_ctx
+                        or "к правилам" in line_ctx):
                     continue
                 candidate = m.group(1).strip(" .,:;")
                 if not candidate:
@@ -309,6 +335,33 @@ def extract_number_and_date(
             if date_m and is_valid_date(date_m.group(1)):
                 date = date_m.group(1)
                 conf_date = 1.0 if head else 0.7
+            # OCR иногда теряет символ «№» — тогда после «Транспортная
+            # накладная» идёт <дата>\n<номер>. Ловим номер как первую
+            # осмысленную строку после заголовка, которая не похожа на
+            # дату / служебную метку / заголовок раздела.
+            if number == MISSING:
+                for raw in tail.splitlines()[:10]:
+                    ln = raw.strip(" \t|—–-")
+                    if not ln or len(ln) < 2 or len(ln) > 50:
+                        continue
+                    low = ln.lower()
+                    if (low.startswith(("транспортн", "заказ", "дата",
+                                        "экземпляр", "№", "no", "приложение"))
+                            or "накладн" in low):
+                        continue
+                    if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", ln):
+                        continue
+                    if not re.fullmatch(
+                        r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{1,48}", ln
+                    ):
+                        continue
+                    if not re.search(r"\d", ln):
+                        continue
+                    if is_garbage(ln):
+                        continue
+                    number = ln.strip(" .,:;")
+                    conf_num = 0.8 if head else 0.55
+                    break
 
     # Резерв: ищем по всему тексту.
     if number == MISSING and full_text:
@@ -424,7 +477,7 @@ def extract_consignee(section_body: str, full_text: str) -> Tuple[str, float]:
 
 
 _CARGO_NAME_LINE_RE = re.compile(
-    r"^\s*(?:\d+[.)]\s*)?н.{1,5}мен\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*(.+)$",
+    r"^\s*(?:\d+[.)]\s*)?н.{1,5}мен\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*(.*)$",
     re.IGNORECASE,
 )
 _CARGO_MEASURE_LINE_RE = re.compile(
@@ -447,17 +500,33 @@ def _clean_cargo_name(name: str) -> str:
 
 
 def _first_cargo_name_from_lines(lines: List[str]) -> Optional[str]:
-    for ln in lines:
+    pending_label = False
+    for idx, ln in enumerate(lines):
         if _CARGO_END_MARKERS.match(ln):
             break
         m = _CARGO_NAME_LINE_RE.match(ln)
-        if m and m.group(1).strip():
-            return m.group(1).strip()
+        if m:
+            val = m.group(1).strip()
+            if val:
+                return val
+            # «Наименование —» без значения на этой строке: считаем
+            # следующую непустую содержательную строку собственно именем.
+            pending_label = True
+            continue
         low = ln.lower()
         if low.startswith("груз:") or low.startswith("груз —") or low.startswith("груз -"):
             parts = re.split(r"[:\-–—]", ln, maxsplit=1)
             if len(parts) == 2 and parts[1].strip():
                 return parts[1].strip()
+            continue
+        if pending_label:
+            if _CARGO_MEASURE_LINE_RE.match(low):
+                continue
+            if _CARGO_KOL_VO_MEST_RE.search(low):
+                continue
+            if not re.search(r"[А-Яа-яЁёA-Za-z]{3,}", ln):
+                continue
+            return ln
     # Не нашли по меткам — первая «содержательная» строка.
     for ln in lines:
         if _CARGO_END_MARKERS.match(ln):
@@ -546,16 +615,15 @@ def extract_carrier(section_body: str, full_text: str) -> Tuple[str, float]:
         if m:
             return m.group(0).strip(), 1.0
         lines = _meaningful_lines(section_body)
-        # Отбрасываем строки с чисто финансовыми реквизитами (ИНН/КПП/...).
-        non_fin = [ln for ln in lines if not _FINANCIAL_MARKER_RE.search(ln)]
-        # Если в перевозчике указана организация (ООО/АО/ИП…) — берём первую
-        # такую строку: «ООО ТрансЛогистик-Север, г. Санкт-Петербург» → "ООО …".
-        org_lines = [ln for ln in non_fin if _ORG_PREFIX_RE.search(ln)]
+        # Если в перевозчике указана организация (ООО/АО/ИП/«000»…) —
+        # берём её, обрезая всё после первого финансового маркера.
+        org_lines = [ln for ln in lines if _ORG_PREFIX_RE.search(ln)]
         if org_lines:
             target = org_lines[0]
             target = _trim_to_org(target)
             target = _cut_before_financial(target)
             return target[:200].strip(" ,;"), 0.8
+        non_fin = [ln for ln in lines if not _FINANCIAL_MARKER_RE.search(ln)]
         if non_fin:
             return non_fin[-1][:200], 0.7
         if lines:
@@ -708,17 +776,40 @@ def _looks_noisy(line: str) -> bool:
     return False
 
 
-def _reception_pick_line(lines: List[str]) -> Optional[str]:
-    for ln in lines:
+def _reception_collect(lines: List[str]) -> Optional[str]:
+    """Собирает первую содержательную строку и ещё до 3 следующих,
+    пока не появится ИНН / 10–12 цифр подряд (OCR мог потерять «ИНН»).
+    """
+    if not lines:
+        return None
+    start = 0
+    for i, ln in enumerate(lines):
         if _ORG_PREFIX_RE.search(ln):
-            return ln
-    return lines[0] if lines else None
+            start = i
+            break
+    collected: List[str] = []
+    for ln in lines[start: start + 4]:
+        collected.append(ln)
+        if _INN_INCLUSIVE_RE.search(ln) or re.search(r"\b\d{10,12}\b", ln):
+            break
+    return ", ".join(collected)
 
 
 def _reception_trim(target: str) -> str:
     target = _trim_to_org(target)
+    # OCR-огрызок «, Ин,» / «, ИН,» перед 10–12 цифр → восстанавливаем «ИНН ».
+    target = re.sub(
+        r",\s*[ИИ]н{1,2}\.?\s*,?\s*(?=\d{10,12}\b)",
+        ", ИНН ", target, flags=re.IGNORECASE,
+    )
     cut_inn = _cut_at_inn_inclusive(target)
+    if not cut_inn:
+        m = re.search(r"\b\d{10,12}\b", target)
+        if m:
+            cut_inn = target[: m.end()].strip(" ,;")
     target = cut_inn if cut_inn else _cut_before_financial(target)
+    # Огрызки «, Ин» / «, И» / «, Н» в самом конце.
+    target = re.sub(r",\s*[А-Яа-яЁёA-Za-z]{1,3}\.?\s*$", "", target)
     return target[:500].strip(" ,;")
 
 
@@ -738,7 +829,7 @@ def extract_reception(section_body: str, full_text: str) -> Tuple[str, float]:
                 r"[А-Яа-яЁёA-Za-z]{4,}|\d{5,}|\d{2}\.\d{2}\.\d{4}", ln
             )
         ]
-        target = _reception_pick_line(cleaned)
+        target = _reception_collect(cleaned)
         if target:
             target = _reception_trim(target)
             if target and not is_garbage(target):
@@ -751,7 +842,7 @@ def extract_reception(section_body: str, full_text: str) -> Tuple[str, float]:
             chunk = _RECEPTION_STOP.split(chunk, maxsplit=1)[0]
             lines = [ln.strip() for ln in chunk.splitlines() if not _looks_noisy(ln)]
             lines = [ln for ln in lines if ln]
-            target = _reception_pick_line(lines)
+            target = _reception_collect(lines)
             if target:
                 target = _reception_trim(target)
                 if target and not is_garbage(target):
