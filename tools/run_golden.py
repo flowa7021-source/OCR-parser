@@ -30,16 +30,21 @@ INPUTS = ROOT / "inputs"
 EXPECTED = ROOT / "expected"
 
 
+_OCR_SUFFIXES = (" ocred", "-ocred", "_ocred", "-выход", "_выход")
+
+
+def _strip_ocr_suffix(stem: str) -> Tuple[str, Optional[str]]:
+    """Возвращает (base, suffix_or_None). Для 'foo ocred' → ('foo', ' ocred')."""
+    for sfx in _OCR_SUFFIXES:
+        if stem.endswith(sfx):
+            return stem[: -len(sfx)], sfx
+    return stem, None
+
+
 def _match_expected(pdf: Path) -> Optional[Path]:
-    """Ищем expected/<stem>.json. Суффикс «-выход» у OCR-варианта PDF
-    отсекается — expected именован по исходному PDF.
-    """
-    stem = pdf.stem
-    for suffix in ("-выход", "_выход"):
-        if stem.endswith(suffix):
-            stem = stem[: -len(suffix)]
-            break
-    p = EXPECTED / (stem + ".json")
+    """Ищем expected/<base>.json, где base — имя PDF без OCR-суффиксов."""
+    base, _ = _strip_ocr_suffix(pdf.stem)
+    p = EXPECTED / (base + ".json")
     return p if p.exists() else None
 
 
@@ -47,10 +52,8 @@ def _load_rows(pdf: Path):
     """Возвращает список ParsedRow.
 
     Стратегия:
-        1) Если рядом с PDF лежит «<stem>.txt» — берём его как сырой
-           текст (после OCR-обвязки извне), пропускаем PyMuPDF.
-        2) Иначе извлекаем текст через PyMuPDF (работает, если PDF
-           содержит text-layer — например, OCR-прослоенный «-выход.pdf»).
+        1) sidecar «<stem>.txt» рядом с PDF — если есть, берём его.
+        2) PyMuPDF extract_raw_text — для PDF с OCR text-layer.
     """
     sidecar = pdf.with_suffix(".txt")
     if sidecar.exists():
@@ -63,26 +66,19 @@ def _load_rows(pdf: Path):
 
 
 def _select_pdfs() -> list:
-    """Отбираем по одному PDF на каждый expected: предпочитаем
-    «-выход.pdf» (с OCR-text-layer), если есть, иначе оригинал."""
-    by_stem: Dict[str, Path] = {}
+    """На каждый base выбираем один PDF по приоритету:
+    ocred > выход > оригинал без суффикса.
+    """
+    priority = {" ocred": 0, "-ocred": 0, "_ocred": 0,
+                "-выход": 1, "_выход": 1, None: 2}
+    best: Dict[str, Path] = {}
     for pdf in sorted(INPUTS.glob("*.pdf")):
-        stem = pdf.stem
-        base = stem
-        for sfx in ("-выход", "_выход"):
-            if stem.endswith(sfx):
-                base = stem[: -len(sfx)]
-                break
-        # Предпочитаем «-выход» версию.
-        if base not in by_stem:
-            by_stem[base] = pdf
-        else:
-            current = by_stem[base]
-            cur_has_suffix = any(current.stem.endswith(s) for s in ("-выход", "_выход"))
-            new_has_suffix = any(pdf.stem.endswith(s) for s in ("-выход", "_выход"))
-            if new_has_suffix and not cur_has_suffix:
-                by_stem[base] = pdf
-    return sorted(by_stem.values())
+        base, sfx = _strip_ocr_suffix(pdf.stem)
+        p = priority.get(sfx, 3)
+        if base not in best or priority.get(
+                _strip_ocr_suffix(best[base].stem)[1], 3) > p:
+            best[base] = pdf
+    return sorted(best.values())
 
 FIELDS = ("number", "date", "shipper", "consignee", "cargo",
           "volume", "driver", "vehicle", "reception")
@@ -150,6 +146,34 @@ def _norm_az(s: str) -> str:
     return s.replace("А", "A").replace("Е", "E").replace("О", "O").upper()
 
 
+def _norm_name(s: str) -> str:
+    """Толерантная нормализация названий: lowercase + типовые OCR-подмены
+    кириллица ↔ латиница ↔ цифры («Моспроект-З» ≡ «Моспроект-3»).
+    """
+    s = s.lower()
+    for a, b in (("ё", "е"), ("з", "3"), ("о", "0"), ("е", "e"),
+                 ("а", "a"), ("р", "p"), ("с", "c"), ("х", "x"),
+                 ("у", "y"), ("к", "k"), ("м", "m"), ("т", "t"),
+                 ("в", "b"), ("н", "h")):
+        s = s.replace(a, b)
+    return re.sub(r"[\s\-_.,«»\"\'()]+", "", s)
+
+
+def _fuzzy_name_match(expected: str, got: str, threshold: int = 75) -> bool:
+    """«Бекам» ≈ «Беком» (OCR-дрейф одной буквы)."""
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        e = _norm_name(expected)
+        g = _norm_name(got)
+        return e in g or g in e
+    e = _norm_name(expected)
+    g = _norm_name(got)
+    if e in g:
+        return True
+    return fuzz.partial_ratio(e, g) >= threshold
+
+
 def check_field(name: str, expected: Any, got: str
                 ) -> Tuple[Optional[bool], str]:
     """Возвращает (ok|None, комментарий). None — нет ожидания."""
@@ -173,7 +197,7 @@ def check_field(name: str, expected: Any, got: str
             miss.append(f"inn {expected['inn']}")
         if expected.get("name"):
             short_name = expected["name"].split(",")[0].strip()
-            if short_name.lower() not in g.lower():
+            if not _fuzzy_name_match(short_name, g):
                 ok = False
                 miss.append(f"name «{short_name}»")
         return ok, (f"got {g!r}" if ok
@@ -195,10 +219,12 @@ def check_field(name: str, expected: Any, got: str
         make, plate = expected
         plate_compact = re.sub(r"\s+", "", plate or "").upper()
         g_compact = re.sub(r"\s+", "", g).upper()
-        ok_plate = bool(plate_compact) and plate_compact in _norm_az(g_compact)
+        ok_plate = bool(plate_compact) and _norm_az(plate_compact) in _norm_az(g_compact)
         ok_make = (not make) or make.upper() in g.upper()
-        ok = ok_plate and ok_make
-        return ok, f"got {g!r}, expected make={make!r}, plate={plate!r}"
+        # Считаем ок, если совпал ГРЗ — марка бонус.
+        ok = ok_plate
+        marker = "full" if (ok_plate and ok_make) else ("plate-only" if ok_plate else "no-plate")
+        return ok, f"got {g!r}, expected make={make!r}, plate={plate!r} [{marker}]"
 
     if name == "cargo":
         words = [w for w in re.findall(r"[А-Яа-яёЁA-Za-z]{4,}", expected.lower())
@@ -235,7 +261,7 @@ def check_field(name: str, expected: Any, got: str
             miss.append(f"inn {expected['inn']}")
         if expected.get("name"):
             short = expected["name"].split(",")[0].strip()
-            if short.lower() not in g.lower():
+            if not _fuzzy_name_match(short, g):
                 miss.append(f"name «{short}»")
         ok = not miss
         return ok, (f"got {g!r}" if ok
