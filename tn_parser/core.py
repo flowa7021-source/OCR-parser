@@ -91,9 +91,24 @@ def extract_raw_text(pdf_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_row(text: str, source: str) -> ParsedRow:
+def _build_row(text: str, source: str, global_fallback: str = "") -> ParsedRow:
     sections = split_sections(text)
     fields = extract_all(sections, text)
+
+    # Для сводных PDF (несколько ТН в одном файле) одна TN иногда
+    # располагается на двух страницах, и секция «Груз» попадает в
+    # соседний splitter-документ. Если cargo/volume не нашлись в
+    # своём doc, делаем последнюю попытку в полном тексте PDF.
+    if global_fallback and global_fallback != text:
+        from .fields import extract_cargo, extract_volume  # локальный импорт
+        if fields["cargo"][0] in (MISSING, GARBAGE):
+            val, _ = extract_cargo("", global_fallback)
+            if val not in (MISSING, GARBAGE):
+                fields["cargo"] = (val, 0.3)
+        if fields["volume"][0] in (MISSING, GARBAGE):
+            val, _ = extract_volume("", global_fallback)
+            if val not in (MISSING, GARBAGE):
+                fields["volume"] = (val, 0.3)
 
     row = ParsedRow(source=source)
     row.number = fields["number"][0]
@@ -138,10 +153,13 @@ def parse_text(text: str, source: str) -> List[ParsedRow]:
         return [ParsedRow.empty_missing(source, note="LOW_TEXT")]
 
     documents = split_documents(text)
+    # Для сводных PDF (несколько ТН) передаём полный текст как fallback
+    # для cargo/volume — иначе груз, попавший в чужой doc, теряется.
+    global_fallback = text if len(documents) > 1 else ""
     rows: List[ParsedRow] = []
     for i, doc in enumerate(documents):
         row_source = source if len(documents) == 1 else f"{source}#{i + 1}"
-        rows.append(_build_row(doc, row_source))
+        rows.append(_build_row(doc, row_source, global_fallback))
     return rows
 
 

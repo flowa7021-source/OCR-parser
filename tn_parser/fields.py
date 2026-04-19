@@ -33,6 +33,7 @@ from .validators import (
     format_grz,
     is_valid_date,
     is_valid_grz,
+    is_valid_inn,
 )
 from .models import MISSING, GARBAGE
 
@@ -254,6 +255,14 @@ def _meaningful_lines(body: str) -> List[str]:
     return out
 
 
+def _find_valid_inn_match(s: str) -> Optional["re.Match"]:
+    """Первый валидный (по контрольной сумме ФНС) ИНН в строке."""
+    for m in re.finditer(r"\b(\d{10}|\d{12})\b", s):
+        if is_valid_inn(m.group(1)):
+            return m
+    return None
+
+
 def _cut_at_inn_inclusive(s: str) -> Optional[str]:
     """Если в строке есть «ИНН + 10–12 цифр» — вернуть срез до конца ИНН.
 
@@ -264,7 +273,13 @@ def _cut_at_inn_inclusive(s: str) -> Optional[str]:
     m = _INN_INCLUSIVE_RE.search(s)
     if m:
         return s[: m.end()].strip(" ,;")
-    m = re.search(r"\b[A-Za-zА-Яа-яЁё]{2,4}\.?\s+\d{10,12}\b", s)
+    # Валидный ИНН (по контр-сумме) даже без префикса «ИНН» — сильный
+    # сигнал. Лучше него: ищем «буквы + пробел + 10/12 цифр».
+    m = re.search(r"\b[A-Za-zА-Яа-яЁё]{2,4}\.?\s+(\d{10}|\d{12})\b", s)
+    if m and is_valid_inn(m.group(1)):
+        return s[: m.end()].strip(" ,;")
+    # Фолбэк: просто первый валидный ИНН.
+    m = _find_valid_inn_match(s)
     if m:
         return s[: m.end()].strip(" ,;")
     return None
@@ -286,7 +301,9 @@ def _cut_before_financial(s: str) -> str:
     m = _FINANCIAL_MARKER_RE.search(s)
     if m:
         positions.append(m.start())
-    m = re.search(r"\b\d{10,12}\b", s)
+    # Ищем ВАЛИДНЫЙ ИНН (по контрольной сумме). Случайные 10–12 цифр
+    # (например, телефон «89306796587») не пройдут.
+    m = _find_valid_inn_match(s)
     if m:
         positions.append(max(0, m.start() - 4))
     if positions:
@@ -549,8 +566,21 @@ def _first_cargo_name_from_lines(lines: List[str]) -> Optional[str]:
             val = m.group(1).strip()
             if val:
                 return val
-            # «Наименование —» без значения на этой строке: считаем
-            # следующую непустую содержательную строку собственно именем.
+            pending_label = True
+            continue
+        # OCR может съесть «на» в «наименование» — тогда строка выглядит
+        # как «„-«именование — X» без начального «н». Ловим корень
+        # «менование». Значение — только то, что идёт ПОСЛЕ этого корня
+        # (иначе мы бы цепляли дефис из OCR-мусора ДО слова).
+        m_word = re.search(r"мен[оае]ван\w*", ln, re.IGNORECASE)
+        if m_word:
+            after = ln[m_word.end():]
+            m2 = re.match(
+                r"[\s:\-–—\u2010-\u2015\u2212]+\s*(.+)",
+                after,
+            )
+            if m2 and m2.group(1).strip():
+                return m2.group(1).strip()
             pending_label = True
             continue
         low = ln.lower()
@@ -566,7 +596,11 @@ def _first_cargo_name_from_lines(lines: List[str]) -> Optional[str]:
                 continue
             if not re.search(r"[А-Яа-яЁёA-Za-z]{3,}", ln):
                 continue
-            return ln
+            # Снимаем начальные тире/двоеточия — они часть разделителя
+            # от заголовка «Наименование» на предыдущей строке.
+            return re.sub(
+                r"^[\s:\-–—\u2010-\u2015\u2212]+", "", ln,
+            ).strip()
     # Не нашли по меткам — первая «содержательная» строка.
     for ln in lines:
         if _CARGO_END_MARKERS.match(ln):
