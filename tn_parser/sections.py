@@ -20,6 +20,12 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
 
+try:
+    from rapidfuzz import fuzz  # type: ignore
+    _HAS_RAPIDFUZZ = True
+except ImportError:  # pragma: no cover
+    _HAS_RAPIDFUZZ = False
+
 
 # Канонические начала заголовков. Более длинные/специфичные — первыми,
 # чтобы «Приём груза» не перекрывалось «Груз».
@@ -74,38 +80,90 @@ _BARE = re.compile(
 )
 
 
+# Эталоны для нечёткого сопоставления (≥ 6 букв — короче брать опасно,
+# слишком много ложных срабатываний).
+_FUZZY_TITLES: List[Tuple[str, Tuple[str, ...]]] = [
+    ("reception", ("приём груза", "прием груза", "погрузка груза")),
+    ("consignee", ("грузополучатель",)),
+    ("shipper", ("грузоотправитель",)),
+    ("vehicle", ("транспортное средство",)),
+    ("carrier", ("перевозчик",)),
+]
+
+_FUZZY_THRESHOLD = 82      # минимальный score для принятия
+_FUZZY_MARGIN = 6          # разрыв между лучшим и вторым кандидатом
+
+_HEAD_WORD_SPLIT_RE = re.compile(r"[\s:.,–—\-]+")
+
+
+def _fuzzy_classify(low: str) -> Optional[str]:
+    """Нечёткая классификация через rapidfuzz.
+
+    Берём первое слово заголовка (head_word) и сравниваем его с эталонами:
+        * fuzz.ratio — для сопоставления одиночного слова;
+        * fuzz.partial_ratio — для составных («транспортное средство»);
+    Чтобы не путать shipper/consignee с близким префиксом «грузо…»,
+    требуем разрыв (_FUZZY_MARGIN) между лучшим и вторым кандидатом.
+    """
+    if not _HAS_RAPIDFUZZ:
+        return None
+    head_word = _HEAD_WORD_SPLIT_RE.split(low, maxsplit=1)[0]
+    if len(head_word) < 5:
+        return None
+    candidate_full = low[:40]
+    scores: List[Tuple[str, int]] = []
+    for role, names in _FUZZY_TITLES:
+        best = 0
+        for name in names:
+            s1 = fuzz.ratio(head_word, name.split()[0])
+            s2 = fuzz.partial_ratio(candidate_full, name)
+            best = max(best, s1, s2)
+        scores.append((role, best))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    if not scores or scores[0][1] < _FUZZY_THRESHOLD:
+        return None
+    if len(scores) > 1 and scores[0][1] - scores[1][1] < _FUZZY_MARGIN:
+        return None
+    return scores[0][0]
+
+
 def _classify_title(title: str) -> Optional[str]:
-    """По тексту заголовка определяет роль или "__ignored__"."""
+    """По тексту заголовка определяет роль или "__ignored__".
+
+    Стратегия (в порядке): __ignored__ → точный startswith по
+    каноническим именам → специальная обработка «груз…» → fuzzy-match
+    через rapidfuzz (порог 82, margin 6).
+    """
     low = title.lower().strip()
     for ign in _IGNORED_TITLES:
         if low.startswith(ign):
             return "__ignored__"
-    # «груз…» — особый случай: разные графы начинаются с этого слова, а
-    # OCR часто корёжит «грузоотправитель» → «грузовтиравитель»,
-    # «грузостправитель», «грузопалучатель» и т.п. Простой startswith
-    # ложно классифицирует их как «груз» (cargo). Поэтому ниже —
-    # явные группы признаков.
-    if low.startswith("груз"):
-        rest = low[4:]
-        # Получатель: «грузополуч…», OCR «грузопал…», «грузопел…».
-        if re.match(r"[ово]{0,2}(?:получ|пелуч|палуч|опуч)", rest):
-            return "consignee"
-        # Отправитель: «грузоотправ…», OCR «грузотправ…», «грузовтир…»,
-        # «грузостправ…», «грузотпр…», «грузотир…».
-        if re.match(r"[ов]{0,2}(?:отправ|тправ|втир|стправ|тир|тпр)", rest):
-            return "shipper"
-        # Чистый «груз» (раздел «3. Груз»): после «груз» либо ничего,
-        # либо знак-разделитель (пробел, двоеточие, тире), либо OCR-хвост
-        # с маленькими буквами длиной ≤ 1 («груз», «грузы»).
-        if rest == "" or rest[0] in " :.,-–—\t":
-            return "cargo"
-        # Прочее «груз…» (грузооборот, грузоподъёмность и т.п.) — игнор.
-        return None
+    # Точное совпадение для длинных эталонов (быстрый путь).
     for role, names in _ROLE_TITLES:
+        if role == "cargo":
+            continue  # «груз» обрабатываем ниже отдельно
         for name in names:
             if low.startswith(name):
                 return role
-    return None
+    # «груз…» — особый случай (см. блок ниже).
+    if low.startswith("груз"):
+        rest = low[4:]
+        if not rest or rest[0] in " :.,-–—\t":
+            return "cargo"
+        # Дальше — однозначные OCR-варианты shipper/consignee
+        # (быстрый путь до fuzzy):
+        if re.match(r"[ово]{0,2}(?:получ|пелуч|палуч|опуч)", rest):
+            return "consignee"
+        if re.match(r"[ов]{0,2}(?:отправ|тправ|втир|стправ|тир|тпр)", rest):
+            return "shipper"
+        # Если ничего не подошло — пускаем fuzzy для shipper/consignee
+        # (он ловит произвольные OCR-искажения, не зашитые выше).
+        fz = _fuzzy_classify(low)
+        if fz in ("shipper", "consignee"):
+            return fz
+        return None
+    # Не-«груз» заголовки: пробуем fuzzy для остальных ролей.
+    return _fuzzy_classify(low)
 
 
 def _find_markers(text: str) -> List[Tuple[int, str]]:
