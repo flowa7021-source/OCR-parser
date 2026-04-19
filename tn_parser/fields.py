@@ -602,35 +602,22 @@ def _compact_grz_search(region: str) -> Optional[str]:
     return None
 
 
-def extract_carrier(section_body: str, full_text: str) -> Tuple[str, float]:
-    """Перевозчик: только правая колонка (ФИО).
+def extract_driver(section_body: str, full_text: str) -> Tuple[str, float]:
+    """Водитель: ТОЛЬКО ФИО из правой колонки графы 6 «Перевозчик».
 
-    Приоритет:
-        1) _FIO_RE — «Иванов И.И.» или «И.И. Иванов» → conf 1.0
-        2) последняя непустая не-служебная строка → conf 0.7
-        3) всё содержимое → conf 0.5
+    Логика:
+        1) _FIO_RE («Иванов И.И.» / «И.И. Иванов») в секции → conf 1.0
+        2) _FIO_RE по всему тексту → conf 0.5
+        3) MISSING — название компании-перевозчика сюда НЕ попадает.
+
+    Если в графе 6 нет ФИО (только название компании или «Самовывоз»),
+    поле остаётся пустым — это семантически правильно, водителя в форме
+    не указали.
     """
     if section_body:
         m = _FIO_RE.search(section_body)
         if m:
             return m.group(0).strip(), 1.0
-        lines = _meaningful_lines(section_body)
-        # Если в перевозчике указана организация (ООО/АО/ИП/«000»…) —
-        # берём её, обрезая всё после первого финансового маркера.
-        org_lines = [ln for ln in lines if _ORG_PREFIX_RE.search(ln)]
-        if org_lines:
-            target = org_lines[0]
-            target = _trim_to_org(target)
-            target = _cut_before_financial(target)
-            return target[:200].strip(" ,;"), 0.8
-        non_fin = [ln for ln in lines if not _FINANCIAL_MARKER_RE.search(ln)]
-        if non_fin:
-            return non_fin[-1][:200], 0.7
-        if lines:
-            return lines[-1][:200], 0.7
-        stripped = section_body.strip()
-        if stripped:
-            return stripped[:200], 0.5
 
     if full_text:
         m = _FIO_RE.search(full_text)
@@ -863,7 +850,7 @@ def extract_all(sections: Dict[str, str], full_text: str) -> Dict[str, Tuple[str
 
     shipper, c_shipper = extract_shipper(sections.get("shipper", ""), full_text)
     consignee, c_consignee = extract_consignee(sections.get("consignee", ""), full_text)
-    carrier, c_carrier = extract_carrier(sections.get("carrier", ""), full_text)
+    driver, c_driver = extract_driver(sections.get("carrier", ""), full_text)
     cargo, c_cargo = extract_cargo(cargo_section, full_text)
     volume, c_volume = extract_volume(cargo_section, full_text)
     vehicle, c_vehicle = extract_vehicle(sections.get("vehicle", ""), full_text)
@@ -876,7 +863,7 @@ def extract_all(sections: Dict[str, str], full_text: str) -> Dict[str, Tuple[str
         "consignee": (consignee, c_consignee),
         "cargo": (cargo, c_cargo),
         "volume": (volume, c_volume),
-        "carrier": (carrier, c_carrier),
+        "driver": (driver, c_driver),
         "vehicle": (vehicle, c_vehicle),
         "reception": (reception, c_reception),
     }

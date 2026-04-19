@@ -29,7 +29,7 @@ FIELD_LABELS = {
     "consignee": "Грузополучатель",
     "cargo": "Груз",
     "volume": "Объём",
-    "carrier": "Перевозчик",
+    "driver": "Водитель",
     "vehicle": "Транспортное средство",
     "reception": "Приём груза",
 }
@@ -45,7 +45,7 @@ def _problem_fields(row: ParsedRow, threshold: float = 0.5) -> List[str]:
         "consignee": (conf.consignee, row.consignee),
         "cargo": (conf.cargo, row.cargo),
         "volume": (conf.volume, row.volume),
-        "carrier": (conf.carrier, row.carrier),
+        "driver": (conf.driver, row.driver),
         "vehicle": (conf.vehicle, row.vehicle),
         "reception": (conf.reception, row.reception),
     }

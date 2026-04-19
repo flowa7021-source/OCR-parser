@@ -4,27 +4,57 @@
       "number": "IL-101",
       "date": "10.10.2023",
       "shipper": {
-        "contains": ["ООО", "Омега", "ИНН 7712345678"],
-        "not_contains": ["Сигма", "7798765432", "Грузополучатель", "КПП"]
+        "contains": [
+          "ООО",
+          "Омега",
+          "ИНН 7712345678"
+        ],
+        "not_contains": [
+          "Сигма",
+          "7798765432",
+          "Грузополучатель",
+          "КПП"
+        ]
       },
       "consignee": {
-        "contains": ["ООО", "Сигма"],
-        "not_contains": ["Омега", "7712345678", "ИНН", "КПП"]
+        "contains": [
+          "ООО",
+          "Сигма"
+        ],
+        "not_contains": [
+          "Омега",
+          "7712345678",
+          "ИНН",
+          "КПП"
+        ]
       },
       "cargo": {
-        "contains": ["Бумага"]
-      },
-      "carrier": {
-        "contains": ["Николаев"]
+        "contains": [
+          "Бумага"
+        ]
       },
       "vehicle": {
-        "contains": ["ГАЗель", "А111ВВ77"],
-        "not_contains": ["А 111 ВВ 77"]
+        "contains": [
+          "ГАЗель",
+          "А111ВВ77"
+        ],
+        "not_contains": [
+          "А 111 ВВ 77"
+        ]
       },
       "reception": {
-        "contains": ["Тверская"]
+        "contains": [
+          "Тверская"
+        ]
       },
-      "note_not_contains": ["ERROR"]
+      "note_not_contains": [
+        "ERROR"
+      ],
+      "driver": {
+        "contains": [
+          "Николаев"
+        ]
+      }
     }
   ]
 }

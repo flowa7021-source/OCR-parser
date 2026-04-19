@@ -24,19 +24,19 @@ def _sample_rows():
         waybill="Транспортная накладная № 001",
         date="01.01.2024", number="001",
         shipper="ООО Ромашка", consignee="ООО Василёк",
-        cargo="Мука", volume="500 шт", carrier="Иванов И.И.",
+        cargo="Мука", volume="500 шт", driver="Иванов И.И.",
         vehicle="KAMAZ\nА123ВС777", reception="г. Москва 01.01.2024",
         source="a.pdf", note="",
         confidence=FieldConfidence(
             date=1.0, number=0.9, shipper=0.9, consignee=0.9,
-            cargo=0.9, volume=0.9, carrier=0.9, vehicle=1.0, reception=0.9,
+            cargo=0.9, volume=0.9, driver=0.9, vehicle=1.0, reception=0.9,
         ),
     )
     low = ParsedRow(
         waybill="Транспортная накладная",
         date="отсутствует", number="отсутствует",
         shipper="отсутствует", consignee="отсутствует",
-        cargo="отсутствует", volume="отсутствует", carrier="отсутствует",
+        cargo="отсутствует", volume="отсутствует", driver="отсутствует",
         vehicle="отсутствует", reception="отсутствует",
         source="b.pdf", note="LOW_CONF",
         confidence=FieldConfidence(),
@@ -56,10 +56,10 @@ class TestExcel:
         headers = [ws.cell(row=1, column=i + 1).value for i in range(len(COLUMNS))]
         assert len(headers) == 13
         assert headers[-1] == "Уверенность, %"
-        # Объём — между «Груз» и «Перевозчик».
+        # Объём — между «Груз» и «Водитель».
         assert "Объём" in headers
         assert headers.index("Объём") == headers.index("Груз") + 1
-        assert headers.index("Перевозчик") == headers.index("Объём") + 1
+        assert headers.index("Водитель") == headers.index("Объём") + 1
 
     def test_confidence_values(self, tmp_path):
         high, low, err = _sample_rows()

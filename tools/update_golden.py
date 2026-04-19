@@ -41,7 +41,7 @@ from tn_parser.normalize import normalize_for_sections  # noqa: E402
 
 _FIELDS = (
     "number", "date", "shipper", "consignee",
-    "cargo", "carrier", "vehicle", "reception",
+    "cargo", "driver", "vehicle", "reception",
 )
 
 

@@ -212,7 +212,7 @@ def test_golden_case_via_pdf_pipeline(expected_path: Path, tmp_path: Path):
 
     for i, (row, exp) in enumerate(zip(rows, expected_rows)):
         for field in ("number", "date", "shipper", "consignee",
-                      "cargo", "carrier", "vehicle", "reception"):
+                      "cargo", "driver", "vehicle", "reception"):
             if field not in exp:
                 continue
             value = getattr(row, field)
