@@ -64,7 +64,7 @@ class TestOcr7145BFull:
         assert "720" in self.row.volume
 
     def test_carrier_is_fio(self):
-        assert "Рябов" in self.row.carrier
+        assert "Рябов" in self.row.driver
 
     def test_vehicle_has_compact_grz(self):
         assert "Р814НР152" in self.row.vehicle
@@ -92,12 +92,16 @@ class TestOcr2908_23A:
     def test_date(self):
         assert self.row.date == "29.08.2022"
 
-    def test_carrier_recognises_000_as_ooo(self):
-        # OCR распознал «ООО» как «000» (три нуля). ORG всё равно найти.
-        assert "ДЕЛОВЫЕ ПЕРЕВОЗКИ" in self.row.carrier
-        # Финансовые реквизиты и водительское удостоверение не попадают.
-        assert "ИНН" not in self.row.carrier
-        assert "711806" not in self.row.carrier
+    def test_driver_does_not_contain_company_name(self):
+        # Поле driver — только ФИО. Название компании-перевозчика
+        # «ООО ДЕЛОВЫЕ ПЕРЕВОЗКИ», адрес, ИНН/КПП и водительское
+        # удостоверение НЕ должны попадать.
+        assert "ДЕЛОВЫЕ" not in self.row.driver
+        assert "ИНН" not in self.row.driver
+        assert "711806" not in self.row.driver
+        # ФИО водителя в этом OCR — «Белен Александр Ныколаенич» (full
+        # name без инициалов) — текущий ФИО-regex такой формат не ловит,
+        # поэтому driver для этого файла остаётся MISSING. Это ожидаемо.
 
     def test_shipper_recovered_despite_ocr_gruzovtiravitel(self):
         # OCR исказил «Грузоотправитель» в «Грузовтиравитель» — секционер

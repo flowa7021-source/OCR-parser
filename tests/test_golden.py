@@ -19,7 +19,7 @@
                               "not_contains": ["является экспедитором"]},
                 "consignee": {"contains": ["Моспроект"]},
                 "cargo":     {"equals": "Блок облицовочный..."},
-                "carrier":   {"contains": ["Самовывоз"]},
+                # Driver («Самовывоз» — не ФИО, поле должно остаться MISSING).
                 "vehicle":   {"equals": "RENAULT Р 814 НР 152"},
                 "reception": {"contains": ["Подолино"]},
                 "conf_min":  0.8,
@@ -75,7 +75,7 @@ def _row_as_dict(row: ParsedRow) -> Dict[str, str]:
         "shipper": row.shipper,
         "consignee": row.consignee,
         "cargo": row.cargo,
-        "carrier": row.carrier,
+        "driver": row.driver,
         "vehicle": row.vehicle,
         "reception": row.reception,
         "note": row.note,
@@ -141,7 +141,7 @@ def test_golden_case(expected_path: Path) -> None:
     for i, (row, exp) in enumerate(zip(rows, expected_rows)):
         scope = f"{case}#{i}"
         for field in ("number", "date", "shipper", "consignee",
-                      "cargo", "carrier", "vehicle", "reception"):
+                      "cargo", "driver", "vehicle", "reception"):
             if field in exp:
                 _check_field(getattr(row, field), exp[field], field, scope)
 

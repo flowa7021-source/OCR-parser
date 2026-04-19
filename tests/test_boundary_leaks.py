@@ -68,7 +68,7 @@ class TestSuffixLeak:
 
     def test_carrier_right_column_only(self):
         # По новому контракту перевозчик = только правая колонка.
-        car = self.row.carrier
+        car = self.row.driver
         # VOLVO — ТС из соседней графы, утечь не должно.
         assert "VOLVO" not in car
         assert "О 777" not in car
@@ -87,7 +87,7 @@ class TestGraphConfusion:
 
     def test_carrier_extracted_despite_missing_dot(self):
         # «6 Перевозчик» без точки. ФИО/фамилия должны извлечься.
-        car = self.row.carrier
+        car = self.row.driver
         assert "Захаров" in car
 
     def test_cargo_does_not_leak_into_carrier(self):

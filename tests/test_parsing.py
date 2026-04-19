@@ -112,8 +112,8 @@ class TestRealSample7145B:
     def test_carrier_is_fio_only(self):
         # Новый контракт: перевозчик = правая колонка (ФИО водителя).
         # «Самовывоз» не попадает.
-        assert "Самовывоз" not in self.row.carrier
-        assert "Рябов" in self.row.carrier
+        assert "Самовывоз" not in self.row.driver
+        assert "Рябов" in self.row.driver
 
     def test_vehicle_has_grz_compact_with_newline(self):
         # Формат: «RENAULT\nР814НР152».
@@ -182,9 +182,9 @@ class TestOcrTabularLayout:
 
     def test_carrier_right_column(self):
         # Левая колонка «Самовывоз» НЕ должна попадать, только ФИО.
-        assert "Самовывоз" not in self.row.carrier
-        assert "Рябов" in self.row.carrier
-        assert "(реквизиты" not in self.row.carrier
+        assert "Самовывоз" not in self.row.driver
+        assert "Рябов" in self.row.driver
+        assert "(реквизиты" not in self.row.driver
 
     def test_vehicle_marka_newline_grz(self):
         assert "RENAULT" in self.row.vehicle
@@ -298,7 +298,7 @@ class TestOcrNoise:
         # левая колонка не попадает, значит если ФИО нет, вернётся либо
         # единственная непустая строка («Самовывоз»), либо MISSING.
         # Фиксируем мягкое ожидание: «/ Й /» (OCR-мусор) точно не попадает.
-        assert "/ Й /" not in self.row.carrier
+        assert "/ Й /" not in self.row.driver
 
 
 class TestOcrInlineLayout:
