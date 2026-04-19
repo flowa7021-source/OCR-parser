@@ -55,16 +55,21 @@ _NUMBERED = re.compile(
     r"(?m)^\s*(\d{1,2})\s*[.)\u00a0]\s*([А-ЯЁа-яё][^\n]{0,80})"
 )
 
+# OCR часто теряет точку после номера графы: «6 Перевозчик» вместо «6. Перевозчик».
+# Эту форму принимаем только для ИЗВЕСТНЫХ ролевых названий — иначе любая
+# строка «N слово» (например «1 Наименование» внутри секции «Груз») была бы
+# ошибочно интерпретирована как заголовок новой графы.
+_KNOWN_TITLES = [name for _, names in _ROLE_TITLES for name in names] + list(_IGNORED_TITLES)
+_NUMBERED_NODOT = re.compile(
+    r"(?mi)^\s*(\d{1,2})\s+("
+    + "|".join(re.escape(name) for name in _KNOWN_TITLES)
+    + r")\b[^\n]{0,80}$"
+)
+
 # Заголовок без номера — отдельной строкой.
 _BARE = re.compile(
     r"(?mi)^\s*("
-    + "|".join(
-        re.escape(name)
-        for _, names in _ROLE_TITLES
-        for name in names
-    )
-    + r"|"
-    + "|".join(re.escape(name) for name in _IGNORED_TITLES)
+    + "|".join(re.escape(name) for name in _KNOWN_TITLES)
     + r")\b[^\n]{0,80}$"
 )
 
@@ -91,13 +96,20 @@ def _find_markers(text: str) -> List[Tuple[int, str]]:
     """
     candidates: List[Tuple[int, str]] = []
 
-    # 1) Нумерованные заголовки.
+    # 1) Нумерованные заголовки с точкой/скобкой.
     for m in _NUMBERED.finditer(text):
         role = _classify_title(m.group(2))
         if role is not None:
             candidates.append((m.start(), role))
 
-    # 2) Голые заголовки (на отдельной строке).
+    # 2) Нумерованные заголовки БЕЗ точки («6 Перевозчик») — только для
+    #    известных ролевых заголовков, чтобы не ловить ложные срабатывания.
+    for m in _NUMBERED_NODOT.finditer(text):
+        role = _classify_title(m.group(2))
+        if role is not None:
+            candidates.append((m.start(), role))
+
+    # 3) Голые заголовки (на отдельной строке).
     for m in _BARE.finditer(text):
         role = _classify_title(m.group(1))
         if role is not None:

@@ -90,6 +90,62 @@ def _is_service_or_empty(line: str) -> bool:
     return False
 
 
+# Маркеры «после этой строки реквизиты контрагента закончились».
+# Нужны как end-anchor в extract_org: любой из этих начальных токенов
+# означает, что дальше — подпись/печать/контакт/служебная разметка, и это
+# НЕ должно попадать в поле грузоотправителя/грузополучателя/перевозчика.
+_ORG_END_MARKERS = re.compile(
+    r"^(?:"
+    r"подпис[ьиея]"                        # Подпись, Подписью
+    r"|м\.?\s*п\.?\b"                      # МП, М.П.
+    r"|печат[ьи]\b"
+    r"|контактн(?:ое|ый|ого)\s+лиц"        # Контактное лицо
+    r"|дата\s+составлен"
+    r"|ответственн[оы]й\s+за"
+    r"|должност[ьи]\b"
+    r"|доверенност"
+    r"|ф\.?\s*и\.?\s*о\.?\s+(?:водител|ответствен|предста)"
+    r")",
+    re.IGNORECASE,
+)
+
+# Маркеры «после этой строки наименование груза закончилось». Следующие
+# атрибуты (класс опасности, упаковка, тара, способ погрузки, условия
+# хранения) — отдельные графы, не часть названия.
+_CARGO_END_MARKERS = re.compile(
+    r"^(?:"
+    r"класс\s+опасност"
+    r"|упаковк"
+    r"|тара\b"
+    r"|способ\s+(?:погрузк|упаковк)"
+    r"|условия\s+(?:хранен|перевозк)"
+    r"|маркировк"
+    r"|номер\s+контейнер"
+    r")",
+    re.IGNORECASE,
+)
+
+# Ключевые слова соседних граф — используется для обрезки fallback-regex:
+# когда одно поле и его «сосед» оказались на одной строке OCR.
+_ADJACENT_FIELD_CUTOFF = re.compile(
+    r"\b(?:"
+    r"грузоотправител"
+    r"|грузополучател"
+    r"|перевозчик"
+    r"|транспортн(?:ое|ого)\s+средств"
+    r"|при[её]м\s+груз"
+    r"|выдач\w*\s+груз"
+    r"|переадресовк"
+    r"|сопроводительн"
+    r"|стоимость\s+(?:услуг|перевозк)"
+    r"|оговорк"
+    r"|отметк\w+\s+грузо"
+    r"|указан\w+\s+грузоотправ"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _meaningful_lines(body: str) -> List[str]:
     """Разбиваем тело секции на строки, выкидываем служебные."""
     if not body:
@@ -229,8 +285,25 @@ def extract_org(
     """
     if section_body:
         lines = _meaningful_lines(section_body)
-        if lines:
-            joined = ", ".join(ln.rstrip(",") for ln in lines[:max_lines])
+        # End-anchors:
+        # (а) обрываем список реквизитов на первой «служебной» строке
+        #     (подпись, печать, МП, контактное лицо, доверенность);
+        # (б) если внутри строки спрятан заголовок соседней графы
+        #     («…ИНН … Грузополучатель: …» в одной OCR-строке двухколоночной
+        #     формы), режем эту строку и прекращаем добавлять дальнейшие.
+        cut_lines: List[str] = []
+        for ln in lines:
+            if _ORG_END_MARKERS.match(ln):
+                break
+            cut = _ADJACENT_FIELD_CUTOFF.search(ln)
+            if cut and cut.start() > 0:
+                head = ln[:cut.start()].strip(" ,;:-–—")
+                if head:
+                    cut_lines.append(head)
+                break
+            cut_lines.append(ln)
+        if cut_lines:
+            joined = ", ".join(ln.rstrip(",") for ln in cut_lines[:max_lines])
             joined = joined[:max_len].strip(" ,;")
             if joined and not is_garbage(joined):
                 return joined, 0.9
@@ -243,6 +316,12 @@ def extract_org(
         m = pat.search(full_text)
         if m:
             candidate = m.group(1).strip()
+            # End-anchor inline: если в той же строке следом идёт заголовок
+            # соседней графы («Грузополучатель:» рядом с «Грузоотправитель:»),
+            # режем значение до этого заголовка.
+            cut = _ADJACENT_FIELD_CUTOFF.search(candidate)
+            if cut and cut.start() > 0:
+                candidate = candidate[:cut.start()].strip(" ,;:-–—")
             if (candidate and not is_garbage(candidate)
                     and not _SERVICE_LINE_RE.match(candidate)):
                 return candidate, 0.5
@@ -260,6 +339,12 @@ def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
         cleaned: List[str] = []
         for ln in lines:
             low = ln.lower()
+
+            # End-anchor: «Класс опасности», «Упаковка», «Тара», «Способ
+            # погрузки» и т. п. — это отдельные атрибуты груза, не часть
+            # наименования. Дальше — мусор с точки зрения поля cargo.
+            if _CARGO_END_MARKERS.match(ln):
+                break
 
             # "1. Наименование — Блок облицовочный…" → «Блок облицовочный…»
             # Допускаем OCR-варианты: «Нанменование», «Наиименование» и т.п.:
