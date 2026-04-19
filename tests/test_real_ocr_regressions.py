@@ -99,6 +99,18 @@ class TestOcr2908_23A:
         assert "ИНН" not in self.row.carrier
         assert "711806" not in self.row.carrier
 
+    def test_shipper_recovered_despite_ocr_gruzovtiravitel(self):
+        # OCR исказил «Грузоотправитель» в «Грузовтиравитель» — секционер
+        # должен опознать заголовок и заполнить shipper, не cargo.
+        assert "ГЕКСАФОРМ" in self.row.shipper
+        assert "7813266190" in self.row.shipper
+        assert "КПП" not in self.row.shipper
+
+    def test_consignee_present(self):
+        # Заголовок «1. Грузополучатель» (с OCR-ошибкой в номере раздела
+        # — «1.» вместо «2.») всё равно опознаётся как consignee.
+        assert "Моспроект" in self.row.consignee
+
     def test_vehicle_marka_and_compact_grz(self):
         assert "Scania" in self.row.vehicle
         assert "С201ВХ152" in self.row.vehicle

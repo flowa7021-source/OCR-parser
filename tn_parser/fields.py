@@ -553,8 +553,8 @@ def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
 
     if full_text:
         for pat in (
-            r"наименовани\w*\s+груз\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*([^\n\r]{2,400})",
-            r"наименовани\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*([^\n\r]{2,400})",
+            r"н.{1,5}мен\w*\s+груз\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*([^\n\r]{2,400})",
+            r"н.{1,5}мен\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*([^\n\r]{2,400})",
         ):
             m = re.search(pat, full_text, re.IGNORECASE)
             if m:
