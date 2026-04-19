@@ -101,6 +101,7 @@ def _build_row(text: str, source: str) -> ParsedRow:
     row.shipper = fields["shipper"][0]
     row.consignee = fields["consignee"][0]
     row.cargo = fields["cargo"][0]
+    row.volume = fields["volume"][0]
     row.carrier = fields["carrier"][0]
     row.vehicle = fields["vehicle"][0]
     row.reception = fields["reception"][0]
@@ -111,6 +112,7 @@ def _build_row(text: str, source: str) -> ParsedRow:
         shipper=fields["shipper"][1],
         consignee=fields["consignee"][1],
         cargo=fields["cargo"][1],
+        volume=fields["volume"][1],
         carrier=fields["carrier"][1],
         vehicle=fields["vehicle"][1],
         reception=fields["reception"][1],
