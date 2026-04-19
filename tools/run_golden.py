@@ -30,14 +30,27 @@ INPUTS = ROOT / "inputs"
 EXPECTED = ROOT / "expected"
 
 
+def _match_expected(pdf: Path) -> Optional[Path]:
+    """Ищем expected/<stem>.json. Суффикс «-выход» у OCR-варианта PDF
+    отсекается — expected именован по исходному PDF.
+    """
+    stem = pdf.stem
+    for suffix in ("-выход", "_выход"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    p = EXPECTED / (stem + ".json")
+    return p if p.exists() else None
+
+
 def _load_rows(pdf: Path):
     """Возвращает список ParsedRow.
 
     Стратегия:
         1) Если рядом с PDF лежит «<stem>.txt» — берём его как сырой
            текст (после OCR-обвязки извне), пропускаем PyMuPDF.
-        2) Иначе извлекаем текст через PyMuPDF (работает только на
-           PDF с текстовым слоем).
+        2) Иначе извлекаем текст через PyMuPDF (работает, если PDF
+           содержит text-layer — например, OCR-прослоенный «-выход.pdf»).
     """
     sidecar = pdf.with_suffix(".txt")
     if sidecar.exists():
@@ -47,6 +60,29 @@ def _load_rows(pdf: Path):
     if not raw or not raw.strip():
         return None
     return parse_text(raw, pdf.name)
+
+
+def _select_pdfs() -> list:
+    """Отбираем по одному PDF на каждый expected: предпочитаем
+    «-выход.pdf» (с OCR-text-layer), если есть, иначе оригинал."""
+    by_stem: Dict[str, Path] = {}
+    for pdf in sorted(INPUTS.glob("*.pdf")):
+        stem = pdf.stem
+        base = stem
+        for sfx in ("-выход", "_выход"):
+            if stem.endswith(sfx):
+                base = stem[: -len(sfx)]
+                break
+        # Предпочитаем «-выход» версию.
+        if base not in by_stem:
+            by_stem[base] = pdf
+        else:
+            current = by_stem[base]
+            cur_has_suffix = any(current.stem.endswith(s) for s in ("-выход", "_выход"))
+            new_has_suffix = any(pdf.stem.endswith(s) for s in ("-выход", "_выход"))
+            if new_has_suffix and not cur_has_suffix:
+                by_stem[base] = pdf
+    return sorted(by_stem.values())
 
 FIELDS = ("number", "date", "shipper", "consignee", "cargo",
           "volume", "driver", "vehicle", "reception")
@@ -221,7 +257,7 @@ def main() -> int:
         print(f"Папок {INPUTS}/ и {EXPECTED}/ не существует.", file=sys.stderr)
         return 1
 
-    pdfs = sorted(INPUTS.glob("*.pdf"))
+    pdfs = _select_pdfs()
     if not pdfs:
         print(f"В {INPUTS}/ нет PDF.", file=sys.stderr)
         return 1
@@ -231,8 +267,8 @@ def main() -> int:
     }
 
     for pdf in pdfs:
-        exp_path = EXPECTED / (pdf.stem + ".json")
-        if not exp_path.exists():
+        exp_path = _match_expected(pdf)
+        if exp_path is None:
             print(f"\n=== {pdf.name} === (нет expected, пропуск)")
             continue
         expected = json.loads(exp_path.read_text(encoding="utf-8"))
