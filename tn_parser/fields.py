@@ -41,21 +41,23 @@ _DATE_ANY = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
 
 # Номер: не захватываем "Экземпляр №" (подпись у графы экземпляра).
 # N[º°]? убран — голая латинская «N» слишком широкий маркер (матчит «RENAULT» и т.п.).
+# Для «No» обязательна граница слова (\b) — иначе ловит «No» внутри OCR-мусора:
+# «Tpyronoyaren» → «No» + «yaren» ≠ номер.
 _NUMBER_AFTER_SYMBOL = re.compile(
-    r"(?:№|No\.?)\s*[:\-–—]?\s*"
+    r"(?:№|\bNo\.?)\s*[:\-–—]?\s*"
     r"([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{0,48})",
     re.IGNORECASE,
 )
 # Запасной: номер вплотную к "№" без пробела («№7145/Б»)
 _NUMBER_STICKY = re.compile(
-    r"(?:№|No\.?)\s*\n?\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{0,48})",
+    r"(?:№|\bNo\.?)\s*\n?\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{0,48})",
     re.IGNORECASE,
 )
 # Терпимый к OCR-шуму между «№» и значением: «№ — |7145/Б» (форма с
 # разделительной колонкой). \n намеренно НЕ включён — перенос строки
 # означает, что значение поля пустое.
 _NUMBER_LAX = re.compile(
-    r"(?:№|No\.?)[ \t\|:\-–—_.]{0,8}"
+    r"(?:№|\bNo\.?)[ \t\|:\-–—_.]{0,8}"
     r"([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-_/.]{1,48})",
     re.IGNORECASE,
 )
@@ -172,6 +174,12 @@ _FIO_RE = re.compile(
     r"\b[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\."
     r"|\b[А-ЯЁ]\.\s?[А-ЯЁ]\.\s+[А-ЯЁ][а-яё]+"
 )
+# Полное ФИО — Фамилия Имя Отчество (без инициалов). Первое слово
+# допускает OCR-искажение (кириллица/латиница вперемешку: «Fentes
+# Александр Николаснич»), остальные два строго кириллицей.
+_FIO_FULL_RE = re.compile(
+    r"\b[A-Za-zА-ЯЁа-яё]{3,14}[ \t]+[А-ЯЁ][а-яё]{2,14}[ \t]+[А-ЯЁ][а-яё]{2,14}\b"
+)
 # OCR регулярно искажает «шт»: «нтт», «иіт», «шт.», «штт» и пр.
 # Допускаем 2–3 буквы из множества {ш, н, и, т, i, ї}, последняя — обязательно «т».
 _SHT_OCR = r"(?:шт|штт|нтт?|нт|ит|иіт|иiт|штi|штi\.?)"
@@ -247,18 +255,42 @@ def _meaningful_lines(body: str) -> List[str]:
 
 
 def _cut_at_inn_inclusive(s: str) -> Optional[str]:
-    """Если в строке есть «ИНН + 10–12 цифр» — вернуть срез до конца ИНН."""
+    """Если в строке есть «ИНН + 10–12 цифр» — вернуть срез до конца ИНН.
+
+    Толерантен к OCR-искажениям префикса «ИНН»: «ИНИ», «HHH», «ИНI»,
+    «Инн», «И Н Н» — любые 2–4 буквы непосредственно перед группой из
+    10–12 цифр считаем квази-ИНН и обрезаем включительно.
+    """
     m = _INN_INCLUSIVE_RE.search(s)
+    if m:
+        return s[: m.end()].strip(" ,;")
+    m = re.search(r"\b[A-Za-zА-Яа-яЁё]{2,4}\.?\s+\d{10,12}\b", s)
     if m:
         return s[: m.end()].strip(" ,;")
     return None
 
 
 def _cut_before_financial(s: str) -> str:
-    """Обрезать перед первым ИНН/КПП/ОГРН/ОКПО/ОКВЭД/БИК (НЕ включая)."""
+    """Обрезать перед первым финансовым маркером.
+
+    Маркеры:
+        1) _FINANCIAL_MARKER_RE (ИНН/КПП/ОГРН/ОКПО/ОКВЭД/БИК);
+        2) 10–12 цифр подряд — почти гарантированно ИНН, даже если
+           OCR исказил сам префикс «ИНН» → «ИНИ», «HHH», «ИНI» и т.п.
+
+    Берём ту позицию, что встретилась РАНЬШЕ. Без этого после
+    «…, ИНИ 7707820850, КПП 770701001» обрезка по КПП оставляла
+    искажённый ИНН внутри строки.
+    """
+    positions = []
     m = _FINANCIAL_MARKER_RE.search(s)
     if m:
-        return s[: m.start()].strip(" ,;")
+        positions.append(m.start())
+    m = re.search(r"\b\d{10,12}\b", s)
+    if m:
+        positions.append(max(0, m.start() - 4))
+    if positions:
+        return s[: min(positions)].strip(" ,;-–—")
     return s
 
 
@@ -320,6 +352,10 @@ def extract_number_and_date(
                     continue
                 if candidate.lower() in ("экземпляр", "экз"):
                     continue
+                # Номер накладной всегда содержит цифру. Одинокие буквы
+                # («й», «yaren») — это OCR-мусор после потерянного №.
+                if not re.search(r"\d", candidate):
+                    continue
                 if is_garbage(candidate):
                     continue
                 return candidate, base_conf
@@ -341,7 +377,7 @@ def extract_number_and_date(
             # дату / служебную метку / заголовок раздела.
             if number == MISSING:
                 for raw in tail.splitlines()[:10]:
-                    ln = raw.strip(" \t|—–-")
+                    ln = raw.strip(" \t|—–-[]()")
                     if not ln or len(ln) < 2 or len(ln) > 50:
                         continue
                     low = ln.lower()
@@ -477,7 +513,11 @@ def extract_consignee(section_body: str, full_text: str) -> Tuple[str, float]:
 
 
 _CARGO_NAME_LINE_RE = re.compile(
-    r"^\s*(?:\d+[.)]\s*)?н.{1,5}мен\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*(.*)$",
+    # Допускаем до 8 мусорных символов в начале строки: OCR часто ставит
+    # «„-«», «|»», «з—^'» и т.п. перед словом «наименование».
+    r"^[^\nа-яёА-ЯЁa-zA-Z]{0,8}(?:\d+[.)]\s*)?"
+    r"[а-яА-Я\-\^'\"«»„]{0,3}?н.{1,5}мен\w*"
+    r"\s*[:\-–—\u2010-\u2015\u2212]+\s*(.*)$",
     re.IGNORECASE,
 )
 _CARGO_MEASURE_LINE_RE = re.compile(
@@ -565,26 +605,36 @@ def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
     return MISSING, 0.0
 
 
-def extract_volume(cargo_section: str, full_text: str) -> Tuple[str, float]:
-    """Объём/количество мест.
+_KOL_VO_MEST_VALUE_RE = re.compile(
+    r"кол[-\s]?во\s+мест\s*[—:\-–\u2010-\u2015\u2212]?\s*(\d+)",
+    re.IGNORECASE,
+)
 
-    Приоритет: «N шт» внутри наименования → строка «Нетто — X т., Брутто —
-    Y т., Объём — Z м³». Иначе MISSING.
+
+def extract_volume(cargo_section: str, full_text: str) -> Tuple[str, float]:
+    """Объём / количество мест.
+
+    Формат вывода: склейка того, что нашлось, через «, »:
+        «N мест» (количество упаковочных мест),
+        «M шт» (штуки товара внутри наименования),
+        «Нетто — X т., Брутто — Y т., Объём — Z м³».
+    Если ничего — MISSING.
     """
-    if cargo_section:
-        m = _QTY_SHT_INLINE_RE.search(cargo_section)
+    for source, conf in ((cargo_section, 0.9), (full_text, 0.5)):
+        if not source:
+            continue
+        parts: List[str] = []
+        m = _KOL_VO_MEST_VALUE_RE.search(source)
         if m:
-            return m.group(1).strip(), 0.9
-        m = _NETTO_BRUTTO_RE.search(cargo_section)
+            parts.append(f"{m.group(1)} мест")
+        m = _QTY_SHT_INLINE_RE.search(source)
         if m:
-            return m.group(0).strip(" ,;"), 0.9
-    if full_text:
-        m = _QTY_SHT_INLINE_RE.search(full_text)
+            parts.append(m.group(1).strip())
+        m = _NETTO_BRUTTO_RE.search(source)
         if m:
-            return m.group(1).strip(), 0.5
-        m = _NETTO_BRUTTO_RE.search(full_text)
-        if m:
-            return m.group(0).strip(" ,;"), 0.5
+            parts.append(m.group(0).strip(" ,;"))
+        if parts:
+            return ", ".join(parts), conf
     return MISSING, 0.0
 
 
@@ -618,11 +668,39 @@ def extract_driver(section_body: str, full_text: str) -> Tuple[str, float]:
         m = _FIO_RE.search(section_body)
         if m:
             return m.group(0).strip(), 1.0
+        pos = 0
+        while True:
+            m = _FIO_FULL_RE.search(section_body, pos)
+            if not m:
+                break
+            pre = section_body[max(0, m.start() - 5): m.start()].lower()
+            if "ип " not in pre and "ип\n" not in pre:
+                return m.group(0).strip(), 0.9
+            pos = m.end()
 
     if full_text:
-        m = _FIO_RE.search(full_text)
-        if m:
-            return m.group(0).strip(), 0.5
+        # Ищем ФИО только в окне после слова «перевозчик» (допускаем
+        # OCR-искажения: «перевозчи»/«персвояки»/«псревозчнк»…).
+        # Иначе _FIO_RE по всему тексту ловит кладовщика / подпись
+        # из раздела «Приём груза» — это НЕ водитель.
+        anchor = re.search(r"п[ес][рст]евоз\w{0,5}", full_text, re.IGNORECASE)
+        if anchor:
+            window = full_text[anchor.start(): anchor.start() + 1500]
+            m = _FIO_RE.search(window)
+            if m:
+                return m.group(0).strip(), 0.5
+            # Полные ФИО в окне: пропускаем имена, которым предшествует
+            # «ИП » — это руководитель компании-перевозчика, а не
+            # водитель.
+            pos = 0
+            while True:
+                m = _FIO_FULL_RE.search(window, pos)
+                if not m:
+                    break
+                pre = window[max(0, m.start() - 5): m.start()].lower()
+                if "ип " not in pre and "ип\n" not in pre:
+                    return m.group(0).strip(), 0.4
+                pos = m.end()
 
     return MISSING, 0.0
 

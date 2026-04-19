@@ -57,8 +57,11 @@ _IGNORED_TITLES: Tuple[str, ...] = (
 
 
 # Заголовок с номером: «1.», «2)», «6 .», нестрогий разделитель.
+# После разделителя — первое «букво-содержательное» значение; допускаем
+# латиницу (OCR часто превращает кириллицу в её латинский визуальный
+# дубликат: «3.Tpys» вместо «3. Груз»).
 _NUMBERED = re.compile(
-    r"(?m)^\s*(\d{1,2})\s*[.)\u00a0]\s*([А-ЯЁа-яё][^\n]{0,80})"
+    r"(?m)^\s*(\d{1,2})\s*[.)\u00a0]\s*([А-ЯЁа-яёA-Za-z][^\n]{0,80})"
 )
 
 # OCR часто теряет точку после номера графы: «6 Перевозчик» вместо «6. Перевозчик».
@@ -166,6 +169,18 @@ def _classify_title(title: str) -> Optional[str]:
     return _fuzzy_classify(low)
 
 
+# Маппинг по номеру раздела для новой формы ТН (Приложение № 4 к ПП РФ
+# № 2200 от 30.11.2021). Применяется, если _classify_title не опознал
+# название графы — например, OCR превратил «Груз» в «Tpys» или
+# «Перевозчик» в «П!рсвохчик».
+_POSITIONAL_ROLE = {
+    "3": "cargo",
+    "6": "carrier",
+    "7": "vehicle",
+    "8": "reception",
+}
+
+
 def _find_markers(text: str) -> List[Tuple[int, str]]:
     """Возвращает отсортированный список (offset, role|"__ignored__").
 
@@ -178,6 +193,12 @@ def _find_markers(text: str) -> List[Tuple[int, str]]:
     # 1) Нумерованные заголовки с точкой/скобкой.
     for m in _NUMBERED.finditer(text):
         role = _classify_title(m.group(2))
+        if role is None:
+            # OCR мог полностью исказить название, но цифра раздела
+            # обычно распознаётся. Fallback по номеру — только для
+            # cargo/carrier/vehicle/reception (shipper/consignee
+            # занимают много места и их важно не путать).
+            role = _POSITIONAL_ROLE.get(m.group(1))
         if role is not None:
             candidates.append((m.start(), role))
 
