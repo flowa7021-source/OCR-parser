@@ -146,6 +146,39 @@ _ADJACENT_FIELD_CUTOFF = re.compile(
 )
 
 
+# Новый контракт извлечения.
+_ORG_PREFIX_RE = re.compile(
+    r"\b(?:ООО|ОАО|АО|ЗАО|ПАО|НКО|ПБОЮЛ|ИП|ТОО|КФХ|АНО|ЧУ|ФГУП|ГУП|МУП|ФГБУ|ГБУ|НОУ|АНПО)\b",
+    re.IGNORECASE,
+)
+_INN_INCLUSIVE_RE = re.compile(r"\bИНН\s*\d{10,12}", re.IGNORECASE)
+_FINANCIAL_MARKER_RE = re.compile(
+    r"\b(?:ИНН|КПП|ОГРН|ОКПО|ОКВЭД|БИК)\b", re.IGNORECASE
+)
+_FIO_RE = re.compile(
+    r"\b[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\."
+    r"|\b[А-ЯЁ]\.\s?[А-ЯЁ]\.\s+[А-ЯЁ][а-яё]+"
+)
+_CARGO_QTY_SHT_RE = re.compile(
+    r",?\s*\d+(?:[,.]\d+)?\s*шт\.?\s*$", re.IGNORECASE
+)
+_CARGO_KOL_VO_MEST_RE = re.compile(
+    r"\bкол[-\s]?во\s+мест\b|\bколичество\s+мест\b", re.IGNORECASE
+)
+_QTY_SHT_INLINE_RE = re.compile(
+    r"\b(\d+(?:[,.]\d+)?\s*шт\.?)", re.IGNORECASE
+)
+_NETTO_BRUTTO_RE = re.compile(
+    r"нетто[^\n]*брутто[^\n]*(?:объ[её]м|м[³3])[^\n]*", re.IGNORECASE
+)
+_CARGO_ATTR_SPLIT_RE = re.compile(
+    r"(?i)\b(?:класс\s+опасност|упаковк|тара\b"
+    r"|способ\s+(?:погрузк|упаковк)"
+    r"|условия\s+(?:хранен|перевозк)"
+    r"|маркировк|номер\s+контейнер)"
+)
+
+
 def _meaningful_lines(body: str) -> List[str]:
     """Разбиваем тело секции на строки, выкидываем служебные."""
     if not body:
@@ -195,6 +228,30 @@ def _meaningful_lines(body: str) -> List[str]:
         if not is_garbage(line):
             out.append(line)
     return out
+
+
+def _cut_at_inn_inclusive(s: str) -> Optional[str]:
+    """Если в строке есть «ИНН + 10–12 цифр» — вернуть срез до конца ИНН."""
+    m = _INN_INCLUSIVE_RE.search(s)
+    if m:
+        return s[: m.end()].strip(" ,;")
+    return None
+
+
+def _cut_before_financial(s: str) -> str:
+    """Обрезать перед первым ИНН/КПП/ОГРН/ОКПО/ОКВЭД/БИК (НЕ включая)."""
+    m = _FINANCIAL_MARKER_RE.search(s)
+    if m:
+        return s[: m.start()].strip(" ,;")
+    return s
+
+
+def _trim_to_org(s: str) -> str:
+    """Отрезать левый префикс до первого ORG-маркера (ООО/АО/ИП/...)."""
+    m = _ORG_PREFIX_RE.search(s)
+    if m:
+        return s[m.start():]
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -270,60 +327,94 @@ def extract_number_and_date(
 # ---------------------------------------------------------------------------
 
 
-def extract_org(
-    section_body: str,
-    full_text: str,
-    fallback_kw: str,
-    max_lines: int = 4,
-    max_len: int = 500,
-) -> Tuple[str, float]:
-    """Извлекает реквизиты контрагента из раздела.
+def _collect_org_lines(section_body: str, max_lines: int = 4) -> str:
+    """Склеить первые значимые строки контрагента через запятую.
 
-    Берём до max_lines непустых не-служебных строк и склеиваем через «, ».
-    Это даёт «ООО …, адрес, ИНН …, КПП …». Для карьера в табличной форме
-    также ловим «Самовывоз, Рябов В.К.» — обе колонки в одной ячейке.
+    End-anchors: _ORG_END_MARKERS обрывают, _ADJACENT_FIELD_CUTOFF режет
+    строку и прекращает сбор (защита от склейки двухколоночной формы).
+    """
+    lines = _meaningful_lines(section_body)
+    cut_lines: List[str] = []
+    for ln in lines:
+        if _ORG_END_MARKERS.match(ln):
+            break
+        cut = _ADJACENT_FIELD_CUTOFF.search(ln)
+        if cut and cut.start() > 0:
+            head = ln[: cut.start()].strip(" ,;:-–—")
+            if head:
+                cut_lines.append(head)
+            break
+        cut_lines.append(ln)
+    return ", ".join(ln.rstrip(",") for ln in cut_lines[:max_lines])
+
+
+def _fallback_org_line(full_text: str, fallback_kw: str) -> Optional[str]:
+    pat = re.compile(
+        rf"{fallback_kw}\s*[:\-–—]?\s*\n?\s*([^\n\r]{{2,500}})",
+        re.IGNORECASE,
+    )
+    m = pat.search(full_text)
+    if not m:
+        return None
+    candidate = m.group(1).strip()
+    cut = _ADJACENT_FIELD_CUTOFF.search(candidate)
+    if cut and cut.start() > 0:
+        candidate = candidate[: cut.start()].strip(" ,;:-–—")
+    if not candidate or _SERVICE_LINE_RE.match(candidate):
+        return None
+    return candidate
+
+
+def extract_shipper(section_body: str, full_text: str) -> Tuple[str, float]:
+    """Грузоотправитель: от ORG-префикса до «ИНН \\d+» включительно.
+
+    КПП/ОГРН/ОКПО всегда обрезаем. Если ИНН отсутствует — обрезать
+    перед первым финансовым маркером.
     """
     if section_body:
-        lines = _meaningful_lines(section_body)
-        # End-anchors:
-        # (а) обрываем список реквизитов на первой «служебной» строке
-        #     (подпись, печать, МП, контактное лицо, доверенность);
-        # (б) если внутри строки спрятан заголовок соседней графы
-        #     («…ИНН … Грузополучатель: …» в одной OCR-строке двухколоночной
-        #     формы), режем эту строку и прекращаем добавлять дальнейшие.
-        cut_lines: List[str] = []
-        for ln in lines:
-            if _ORG_END_MARKERS.match(ln):
-                break
-            cut = _ADJACENT_FIELD_CUTOFF.search(ln)
-            if cut and cut.start() > 0:
-                head = ln[:cut.start()].strip(" ,;:-–—")
-                if head:
-                    cut_lines.append(head)
-                break
-            cut_lines.append(ln)
-        if cut_lines:
-            joined = ", ".join(ln.rstrip(",") for ln in cut_lines[:max_lines])
-            joined = joined[:max_len].strip(" ,;")
+        joined = _collect_org_lines(section_body, max_lines=4)
+        if joined:
+            joined = _trim_to_org(joined)
+            cut_inn = _cut_at_inn_inclusive(joined)
+            joined = cut_inn if cut_inn else _cut_before_financial(joined)
+            joined = joined[:500].strip(" ,;")
             if joined and not is_garbage(joined):
                 return joined, 0.9
 
-    if full_text and fallback_kw:
-        pat = re.compile(
-            rf"{fallback_kw}\s*[:\-–—]?\s*\n?\s*([^\n\r]{{2,350}})",
-            re.IGNORECASE,
-        )
-        m = pat.search(full_text)
-        if m:
-            candidate = m.group(1).strip()
-            # End-anchor inline: если в той же строке следом идёт заголовок
-            # соседней графы («Грузополучатель:» рядом с «Грузоотправитель:»),
-            # режем значение до этого заголовка.
-            cut = _ADJACENT_FIELD_CUTOFF.search(candidate)
-            if cut and cut.start() > 0:
-                candidate = candidate[:cut.start()].strip(" ,;:-–—")
-            if (candidate and not is_garbage(candidate)
-                    and not _SERVICE_LINE_RE.match(candidate)):
+    if full_text:
+        candidate = _fallback_org_line(full_text, "грузоотправитель")
+        if candidate:
+            candidate = _trim_to_org(candidate)
+            cut_inn = _cut_at_inn_inclusive(candidate)
+            candidate = cut_inn if cut_inn else _cut_before_financial(candidate)
+            candidate = candidate[:500].strip(" ,;")
+            if candidate and not is_garbage(candidate):
+                return candidate, 0.5
+
+    return MISSING, 0.0
+
+
+def extract_consignee(section_body: str, full_text: str) -> Tuple[str, float]:
+    """Грузополучатель: ORG-префикс → перед первым ИНН/КПП/ОГРН/ОКПО.
+
+    Получатель всегда без ИНН и КПП.
+    """
+    if section_body:
+        joined = _collect_org_lines(section_body, max_lines=4)
+        if joined:
+            joined = _trim_to_org(joined)
+            joined = _cut_before_financial(joined)
+            joined = joined[:500].strip(" ,;")
+            if joined and not is_garbage(joined):
+                return joined, 0.9
+
+    if full_text:
+        candidate = _fallback_org_line(full_text, "грузополучатель")
+        if candidate:
+            candidate = _trim_to_org(candidate)
+            candidate = _cut_before_financial(candidate)
+            candidate = candidate[:500].strip(" ,;")
+            if candidate and not is_garbage(candidate):
                 return candidate, 0.5
 
     return MISSING, 0.0
@@ -332,53 +423,64 @@ def extract_org(
 # ---------------------------------------------------------------------------
 
 
+_CARGO_NAME_LINE_RE = re.compile(
+    r"^\s*(?:\d+[.)]\s*)?н.{1,5}мен\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*(.+)$",
+    re.IGNORECASE,
+)
+_CARGO_MEASURE_LINE_RE = re.compile(
+    r"^(ед\.\s*изм|кол-во|количес|масс|объ[её]м|нетто|брутто|в том числе)\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_cargo_name(name: str) -> str:
+    """Очистить наименование груза: без 'кол-во мест', без хвоста 'N шт',
+    без класса опасности / упаковки / тары."""
+    m_kvm = _CARGO_KOL_VO_MEST_RE.search(name)
+    if m_kvm:
+        name = name[: m_kvm.start()].strip(" ,;-–—")
+    name = _CARGO_QTY_SHT_RE.sub("", name).strip(" ,;-–—")
+    parts = _CARGO_ATTR_SPLIT_RE.split(name, maxsplit=1)
+    if parts:
+        name = parts[0].strip(" ,;-–—")
+    return name[:400].strip(" ,;")
+
+
+def _first_cargo_name_from_lines(lines: List[str]) -> Optional[str]:
+    for ln in lines:
+        if _CARGO_END_MARKERS.match(ln):
+            break
+        m = _CARGO_NAME_LINE_RE.match(ln)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+        low = ln.lower()
+        if low.startswith("груз:") or low.startswith("груз —") or low.startswith("груз -"):
+            parts = re.split(r"[:\-–—]", ln, maxsplit=1)
+            if len(parts) == 2 and parts[1].strip():
+                return parts[1].strip()
+    # Не нашли по меткам — первая «содержательная» строка.
+    for ln in lines:
+        if _CARGO_END_MARKERS.match(ln):
+            break
+        low = ln.lower()
+        if _CARGO_MEASURE_LINE_RE.match(low):
+            continue
+        if not re.search(r"[А-Яа-яЁёA-Za-z]{3,}", ln):
+            continue
+        return ln
+    return None
+
+
 def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
-    """Извлекает наименование груза, снимая префикс «Наименование —»."""
+    """Наименование груза. Без 'Кол-во мест', без хвоста 'N шт',
+    без 'Класс опасности' / 'Упаковка' / 'Тара'."""
     if section_body:
         lines = _meaningful_lines(section_body)
-        cleaned: List[str] = []
-        for ln in lines:
-            low = ln.lower()
-
-            # End-anchor: «Класс опасности», «Упаковка», «Тара», «Способ
-            # погрузки» и т. п. — это отдельные атрибуты груза, не часть
-            # наименования. Дальше — мусор с точки зрения поля cargo.
-            if _CARGO_END_MARKERS.match(ln):
-                break
-
-            # "1. Наименование — Блок облицовочный…" → «Блок облицовочный…»
-            # Допускаем OCR-варианты: «Нанменование», «Наиименование» и т.п.:
-            # н + 1–5 произвольных символов + «мен» + хвост.
-            m = re.match(
-                r"^\s*(?:\d+[.)]\s*)?н.{1,5}мен\w*\s*[:\-–—\u2010-\u2015\u2212]+\s*(.+)$",
-                ln, re.IGNORECASE,
-            )
-            if m and m.group(1).strip():
-                cleaned.append(m.group(1).strip())
-                continue
-            # "Груз: X"
-            if low.startswith("груз:") or low.startswith("груз —"):
-                parts = re.split(r"[:\-–—]", ln, maxsplit=1)
-                if len(parts) == 2 and parts[1].strip():
-                    cleaned.append(parts[1].strip())
-                continue
-            # Пропускаем чисто измерительные строки.
-            if re.match(
-                r"^(ед\.\s*изм|кол-во|количес|масс|объ[её]м|нетто|брутто|в том числе)\b",
-                low,
-            ):
-                continue
-            # Пропускаем строки без единой буквы (только числа и знаки —
-            # обычно «20,52 т., 20,835 т., 8,73 м³»).
-            if not re.search(r"[А-Яа-яЁёA-Za-z]{3,}", ln):
-                continue
-            cleaned.append(ln)
-
-        if cleaned:
-            joined = " ".join(cleaned[:3])
-            joined = joined[:400].strip(" ,;")
-            if joined and not is_garbage(joined):
-                return joined, 0.9
+        name = _first_cargo_name_from_lines(lines)
+        if name:
+            name = _clean_cargo_name(name)
+            if name and not is_garbage(name):
+                return name, 0.9
 
     if full_text:
         for pat in (
@@ -387,10 +489,33 @@ def extract_cargo(section_body: str, full_text: str) -> Tuple[str, float]:
         ):
             m = re.search(pat, full_text, re.IGNORECASE)
             if m:
-                candidate = m.group(1).strip()[:400]
+                candidate = _clean_cargo_name(m.group(1).strip()[:400])
                 if candidate and not is_garbage(candidate):
                     return candidate, 0.5
 
+    return MISSING, 0.0
+
+
+def extract_volume(cargo_section: str, full_text: str) -> Tuple[str, float]:
+    """Объём/количество мест.
+
+    Приоритет: «N шт» внутри наименования → строка «Нетто — X т., Брутто —
+    Y т., Объём — Z м³». Иначе MISSING.
+    """
+    if cargo_section:
+        m = _QTY_SHT_INLINE_RE.search(cargo_section)
+        if m:
+            return m.group(1).strip(), 0.9
+        m = _NETTO_BRUTTO_RE.search(cargo_section)
+        if m:
+            return m.group(0).strip(" ,;"), 0.9
+    if full_text:
+        m = _QTY_SHT_INLINE_RE.search(full_text)
+        if m:
+            return m.group(1).strip(), 0.5
+        m = _NETTO_BRUTTO_RE.search(full_text)
+        if m:
+            return m.group(0).strip(" ,;"), 0.5
     return MISSING, 0.0
 
 
@@ -408,82 +533,111 @@ def _compact_grz_search(region: str) -> Optional[str]:
     return None
 
 
-def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
-    """Транспортное средство: марка + ГРЗ в одной ячейке.
+def extract_carrier(section_body: str, full_text: str) -> Tuple[str, float]:
+    """Перевозчик: только правая колонка (ФИО).
 
-    Формат вывода — «RENAULT Р 814 НР 152»: сначала марка (если есть),
-    потом канонический ГРЗ. Если марки нет — только ГРЗ.
+    Приоритет:
+        1) _FIO_RE — «Иванов И.И.» или «И.И. Иванов» → conf 1.0
+        2) последняя непустая не-служебная строка → conf 0.7
+        3) всё содержимое → conf 0.5
+    """
+    if section_body:
+        m = _FIO_RE.search(section_body)
+        if m:
+            return m.group(0).strip(), 1.0
+        lines = _meaningful_lines(section_body)
+        # Отбрасываем строки с чисто финансовыми реквизитами (ИНН/КПП/...).
+        non_fin = [ln for ln in lines if not _FINANCIAL_MARKER_RE.search(ln)]
+        # Если в перевозчике указана организация (ООО/АО/ИП…) — берём первую
+        # такую строку: «ООО ТрансЛогистик-Север, г. Санкт-Петербург» → "ООО …".
+        org_lines = [ln for ln in non_fin if _ORG_PREFIX_RE.search(ln)]
+        if org_lines:
+            target = org_lines[0]
+            target = _trim_to_org(target)
+            target = _cut_before_financial(target)
+            return target[:200].strip(" ,;"), 0.8
+        if non_fin:
+            return non_fin[-1][:200], 0.7
+        if lines:
+            return lines[-1][:200], 0.7
+        stripped = section_body.strip()
+        if stripped:
+            return stripped[:200], 0.5
+
+    if full_text:
+        m = _FIO_RE.search(full_text)
+        if m:
+            return m.group(0).strip(), 0.5
+
+    return MISSING, 0.0
+
+
+def _vehicle_marka_candidates(section_body: str, grz: Optional[str]) -> List[str]:
+    """Строки, из которых можно вытащить марку. Используем splitlines напрямую,
+    чтобы «MAN TGS», «В 404 КМ» не отфильтровались _meaningful_lines."""
+    out: List[str] = []
+    for raw in section_body.splitlines():
+        ln = raw.strip()
+        if not ln or _is_service_or_empty(ln):
+            continue
+        low = ln.lower()
+        if re.match(r"^\((тип|марка|модель|регистрационн|рег\.?)", low):
+            continue
+        if low.startswith(("марка", "модель", "тип", "т/с")):
+            parts = re.split(r"[:\-–—]", ln, maxsplit=1)
+            if len(parts) == 2 and parts[1].strip():
+                out.append(parts[1].strip())
+            continue
+        if grz:
+            compact_ln = re.sub(
+                r"(?<=[А-ЯЁA-Z0-9])\s+(?=[А-ЯЁA-Z0-9])", "", ln.upper()
+            )
+            m_grz = GRZ_CANDIDATE.search(compact_ln)
+            if m_grz:
+                if m_grz.start() > 0:
+                    ns = 0
+                    end_pos = len(ln)
+                    for ci, ch in enumerate(ln):
+                        if not ch.isspace():
+                            if ns == m_grz.start():
+                                end_pos = ci
+                                break
+                            ns += 1
+                    brand_raw = ln[:end_pos].strip(" ,;()")
+                    if brand_raw and len(brand_raw) >= 2:
+                        out.append(brand_raw)
+                continue
+        if re.search(r"\b(инн|кпп|огрн|окпо)\b", low):
+            continue
+        if 2 <= len(ln) <= 60:
+            out.append(ln)
+    return out
+
+
+def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
+    """Транспортное средство: «МАРКА\\nГРЗ_слитно» (перенос строки внутри ячейки).
+
+    ГРЗ выдаётся без пробелов (С782СК62, не С 782 СК 62).
     """
     if section_body:
         grz = _compact_grz_search(section_body)
-
-        # Строки без служебки и без "(тип, марка …)"-подсказок.
-        lines = _meaningful_lines(section_body)
-
-        # Фильтруем подсказки-пометки вроде «(тип, марка, грузоподъемность…)».
-        def _is_hint(ln: str) -> bool:
-            low = ln.lower()
-            return bool(re.match(r"^\((тип|марка|модель|регистрационн|рег\.?)", low))
-
-        lines = [ln for ln in lines if not _is_hint(ln)]
-
-        # Разделяем строки с меткой «Марка:», «Модель:» и без.
-        marka_parts: List[str] = []
-        for ln in lines:
-            low = ln.lower()
-            if low.startswith(("марка", "модель", "тип", "т/с")):
-                parts = re.split(r"[:\-–—]", ln, maxsplit=1)
-                if len(parts) == 2 and parts[1].strip():
-                    marka_parts.append(parts[1].strip())
-                continue
-            # Строка, в которой есть ГРЗ.
-            if grz:
-                compact_ln = re.sub(
-                    r"(?<=[А-ЯЁA-Z0-9])\s+(?=[А-ЯЁA-Z0-9])", "", ln.upper()
-                )
-                m_grz = GRZ_CANDIDATE.search(compact_ln)
-                if m_grz:
-                    # Если найденный кандидат совпадает с нашим ГРЗ — эта строка
-                    # содержит ГРЗ. Пробуем вытащить марку из префикса до ГРЗ.
-                    if m_grz.start() > 0:
-                        # Считаем непробельные символы в оригинальной строке:
-                        # ищем позицию, где их накопилось m_grz.start() штук.
-                        ns = 0
-                        end_pos = len(ln)
-                        for ci, ch in enumerate(ln):
-                            if not ch.isspace():
-                                if ns == m_grz.start():
-                                    end_pos = ci
-                                    break
-                                ns += 1
-                        brand_raw = ln[:end_pos].strip(" ,;()")
-                        if brand_raw and len(brand_raw) >= 2:
-                            marka_parts.append(brand_raw)
-                    continue
-            # Строки с инн/кпп — точно не ТС.
-            if re.search(r"\b(инн|кпп|огрн|окпо)\b", low):
-                continue
-            # Похоже на название марки (буквы/цифры, короткая).
-            if 2 <= len(ln) <= 60:
-                marka_parts.append(ln)
+        marka_parts = _vehicle_marka_candidates(section_body, grz)
 
         if grz:
-            pretty = format_grz(grz)
+            grz_compact = grz.replace(" ", "")
             if marka_parts:
-                # Берём ПЕРВУЮ содержательную часть (обычно марка в верхней строке).
                 marka = marka_parts[0].strip(" ,;")
-                return f"{marka} {pretty}", 1.0
-            return pretty, 1.0
+                return f"{marka}\n{grz_compact}", 1.0
+            return grz_compact, 1.0
 
-        # ГРЗ не нашли, но раздел есть — отдаём первую содержательную строку.
+        lines = _meaningful_lines(section_body)
         if lines:
             return lines[0][:80], 0.5
 
-    # Фоллбэк — ищем ГРЗ во всём тексте.
     if full_text:
         grz = _compact_grz_search(full_text)
         if grz:
-            return format_grz(grz), 0.6
+            return grz.replace(" ", ""), 0.6
         for pat in (
             r"гос\.?\s*номер\s*[:\-–—]?\s*([^\n\r]{2,40})",
             r"рег\.?\s*знак\s*[:\-–—]?\s*([^\n\r]{2,40})",
@@ -554,39 +708,54 @@ def _looks_noisy(line: str) -> bool:
     return False
 
 
+def _reception_pick_line(lines: List[str]) -> Optional[str]:
+    for ln in lines:
+        if _ORG_PREFIX_RE.search(ln):
+            return ln
+    return lines[0] if lines else None
+
+
+def _reception_trim(target: str) -> str:
+    target = _trim_to_org(target)
+    cut_inn = _cut_at_inn_inclusive(target)
+    target = cut_inn if cut_inn else _cut_before_financial(target)
+    return target[:500].strip(" ,;")
+
+
 def extract_reception(section_body: str, full_text: str) -> Tuple[str, float]:
-    """Приём груза с агрессивной чисткой OCR-шума."""
+    """Приём груза: только ПЕРВАЯ содержательная строка.
+
+    От ORG-префикса до «ИНН \\d+» включительно; КПП/ОГРН/ОКПО обрезаются.
+    Если ни в одной строке нет ORG-префикса — берём первую как есть.
+    """
     if section_body:
         body = _RECEPTION_STOP.split(section_body, maxsplit=1)[0]
-        lines = [ln for ln in body.splitlines() if not _looks_noisy(ln)]
-        # В выживших строках ещё раз выпиливаем одиночные мусорные токены.
-        lines = [strip_garbage_tokens(ln.strip()) for ln in lines]
-        # После стрипинга строка может потерять все осмысленные слова — как
-        # «000 д» после удаления «"Бекам'тбд». Такие остатки — шум.
-        lines = [
-            ln for ln in lines
+        raw = [ln for ln in body.splitlines() if not _looks_noisy(ln)]
+        cleaned = [strip_garbage_tokens(ln.strip()) for ln in raw]
+        cleaned = [
+            ln for ln in cleaned
             if ln and len(ln) > 3 and re.search(
                 r"[А-Яа-яЁёA-Za-z]{4,}|\d{5,}|\d{2}\.\d{2}\.\d{4}", ln
             )
         ]
-        # Отбрасываем повторный блок с реквизитами грузоотправителя, если
-        # он идёт ВТОРЫМ (такое бывает, когда «Приём груза» копирует контент
-        # из раздела 1 — нам это неинтересно, у нас уже есть shipper).
-        if lines:
-            body_clean = "\n".join(lines[:12])[:1200].strip()
-            if body_clean and not is_garbage(body_clean):
-                return body_clean, 0.9
+        target = _reception_pick_line(cleaned)
+        if target:
+            target = _reception_trim(target)
+            if target and not is_garbage(target):
+                return target, 0.9
 
     if full_text:
         m = re.search(r"при[ёе]м\s+груз\w*", full_text, re.IGNORECASE)
         if m:
             chunk = full_text[m.end(): m.end() + 1500]
             chunk = _RECEPTION_STOP.split(chunk, maxsplit=1)[0]
-            lines = [ln for ln in chunk.splitlines() if not _looks_noisy(ln)]
-            cleaned = "\n".join(ln.strip() for ln in lines if ln.strip())[:1200]
-            cleaned = clean_value(cleaned, MISSING, GARBAGE)
-            if cleaned not in (MISSING, GARBAGE):
-                return cleaned, 0.5
+            lines = [ln.strip() for ln in chunk.splitlines() if not _looks_noisy(ln)]
+            lines = [ln for ln in lines if ln]
+            target = _reception_pick_line(lines)
+            if target:
+                target = _reception_trim(target)
+                if target and not is_garbage(target):
+                    return target, 0.5
 
     return MISSING, 0.0
 
@@ -597,20 +766,15 @@ def extract_reception(section_body: str, full_text: str) -> Tuple[str, float]:
 def extract_all(sections: Dict[str, str], full_text: str) -> Dict[str, Tuple[str, float]]:
     """Единая точка: прогоняет все экстракторы и возвращает словарь."""
     head = sections.get("head", "")
+    cargo_section = sections.get("cargo", "")
 
     number, c_num, date, c_date = extract_number_and_date(head, full_text)
 
-    shipper, c_shipper = extract_org(
-        sections.get("shipper", ""), full_text, "грузоотправитель"
-    )
-    consignee, c_consignee = extract_org(
-        sections.get("consignee", ""), full_text, "грузополучатель"
-    )
-    carrier, c_carrier = extract_org(
-        sections.get("carrier", ""), full_text, "перевозчик",
-        max_lines=3, max_len=300,
-    )
-    cargo, c_cargo = extract_cargo(sections.get("cargo", ""), full_text)
+    shipper, c_shipper = extract_shipper(sections.get("shipper", ""), full_text)
+    consignee, c_consignee = extract_consignee(sections.get("consignee", ""), full_text)
+    carrier, c_carrier = extract_carrier(sections.get("carrier", ""), full_text)
+    cargo, c_cargo = extract_cargo(cargo_section, full_text)
+    volume, c_volume = extract_volume(cargo_section, full_text)
     vehicle, c_vehicle = extract_vehicle(sections.get("vehicle", ""), full_text)
     reception, c_reception = extract_reception(sections.get("reception", ""), full_text)
 
@@ -620,6 +784,7 @@ def extract_all(sections: Dict[str, str], full_text: str) -> Dict[str, Tuple[str
         "shipper": (shipper, c_shipper),
         "consignee": (consignee, c_consignee),
         "cargo": (cargo, c_cargo),
+        "volume": (volume, c_volume),
         "carrier": (carrier, c_carrier),
         "vehicle": (vehicle, c_vehicle),
         "reception": (reception, c_reception),

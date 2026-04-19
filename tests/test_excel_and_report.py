@@ -70,7 +70,7 @@ class TestExcel:
         ws = wb.active
         # Колонка confidence — 13-я.
         conf_col = len(COLUMNS)
-        assert ws.cell(row=2, column=conf_col).value == 93  # high ≈ 0.93 → 93%
+        assert ws.cell(row=2, column=conf_col).value == 92  # high ≈ 0.92 → 92%
         assert ws.cell(row=3, column=conf_col).value == 0   # low
         assert ws.cell(row=4, column=conf_col).value == 0   # err
 
@@ -176,7 +176,7 @@ class TestReport:
         assert "[OK  ]" in text
         assert "[WARN]" in text
         assert "[ERR ]" in text
-        assert "93%" in text
+        assert "92%" in text
         # Для low confidence должны быть перечислены проблемные поля.
         assert "Проверить:" in text
         # Для ошибки должен быть виден её текст.
