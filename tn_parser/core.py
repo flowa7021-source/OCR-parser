@@ -19,12 +19,47 @@ from .fields import extract_all
 from .layout import extract_best_text
 from .models import GARBAGE, MISSING, FieldConfidence, ParsedRow
 from .normalize import normalize_for_sections
+from .org_lookup import lookup_by_inn
 from .sections import split_sections
 from .splitter import split_documents
+from .validators import is_valid_inn
 
 
 LOW_TEXT_THRESHOLD = 200  # символов
-CACHE_VERSION = 8  # ↑ при изменении логики парсинга
+CACHE_VERSION = 9  # ↑ при изменении логики парсинга
+
+
+def _enrich_with_inn(raw: str, full_text: str) -> str:
+    """Консервативное обогащение: если в `raw` ИНН отсутствует, но в
+    `full_text` найден валидный ИНН организации с именем, кусок
+    которого присутствует в `raw` — добавляем «, ИНН XXX» в конец.
+
+    НЕ переписываем уже найденное имя (OCR мог распознать «Бекам», а
+    в справочнике «Беком» — нам не надо спорить с экспертом на лету).
+    """
+    if not raw or raw in (MISSING, GARBAGE) or not full_text:
+        return raw
+    import re
+    # Если ИНН уже есть в строке (валидный или нет) — не трогаем,
+    # чтобы не дублировать.
+    if re.search(r"\bИНН\s*\d{10,12}", raw, re.IGNORECASE):
+        return raw
+    if re.search(r"\b(\d{10}|\d{12})\b", raw):
+        return raw
+    raw_low = raw.lower()
+    for m in re.finditer(r"\b(\d{10}|\d{12})\b", full_text):
+        inn = m.group(1)
+        if not is_valid_inn(inn):
+            continue
+        rec = lookup_by_inn(inn)
+        if not rec:
+            continue
+        name = (rec.get("name") or "").lower()
+        # Достаточно 4 первых букв имени в raw, чтобы поверить, что
+        # этот ИНН относится к этой же организации.
+        if name and len(name) >= 4 and name[:4] in raw_low:
+            return f"{raw.rstrip(' ,;')}, ИНН {inn}"
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +179,16 @@ def _build_row(text: str, source: str, global_fallback: str = "") -> ParsedRow:
     if row.confidence.overall() < 0.4:
         notes.append("LOW_CONF")
     row.note = ";".join(notes)
+
+    # LLM-fallback при низкой уверенности. No-op без ANTHROPIC_API_KEY
+    # и без пакета `anthropic` — парсер работает как раньше.
+    if row.confidence.overall() < 0.4:
+        try:
+            from .llm_fallback import improve_row
+            row, _ = improve_row(row, global_fallback or text)
+        except Exception:  # pragma: no cover — никогда не ломаем pipeline
+            pass
+
     return row
 
 
