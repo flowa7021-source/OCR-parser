@@ -96,10 +96,71 @@ def _date_iso_to_ru(s: Optional[str]) -> Optional[str]:
 
 
 def _first_tn(doc: dict) -> Optional[dict]:
-    for d in doc.get("documents", []):
-        if d.get("type") == "TN":
+    """Выбираем первую ТН. Поддерживаем два формата expected:
+
+    A) documents: [{type: "TN", ...}]  — наш старый формат.
+    B) documents: ["UPD", "TTN_LIST", ...] + pages: [{document_type: "TTN",
+       structured_fields: {...}}]  — УПД-пакеты (upd_549).
+    """
+    for d in doc.get("documents", []) or []:
+        if isinstance(d, dict) and d.get("type") == "TN":
             return d
+    # Fallback: новая pages-схема.
+    for p in doc.get("pages", []) or []:
+        if p.get("document_type") in ("TTN", "TN"):
+            sf = p.get("structured_fields") or {}
+            if sf:
+                return _ttn_page_to_legacy(sf)
     return None
+
+
+def _ttn_page_to_legacy(sf: dict) -> dict:
+    """Маппим per-page structured_fields к legacy схеме TN."""
+    consignor = sf.get("consignor") or {}
+    consignee = sf.get("consignee") or {}
+    vehicle = sf.get("vehicle") or {}
+    cargo = sf.get("cargo") or {}
+    loading = sf.get("loading_point") or {}
+    # ttn_date: «20.10.22» → «20.10.2022»
+    tdate = (sf.get("ttn_date") or "").strip()
+    if re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", tdate):
+        tdate = tdate[:6] + "20" + tdate[6:]
+    return {
+        "type": "TN",
+        "number": sf.get("ttn_internal_number") or sf.get("order_number"),
+        "date": _ru_date_to_iso(tdate),
+        "parties": [
+            {"role": "shipper", **{k: consignor.get(k) for k in
+                ("name", "legal_form", "inn", "kpp", "address") if consignor.get(k)}},
+            {"role": "consignee", **{k: consignee.get(k) for k in
+                ("name", "legal_form", "inn", "kpp", "address") if consignee.get(k)}},
+            {"role": "carrier", "driver": {"short_name": sf.get("carrier_driver")}},
+        ],
+        "transport": {
+            "vehicle_make": vehicle.get("brand"),
+            "vehicle_reg_plate": vehicle.get("plate"),
+        },
+        "cargo_header": {
+            "description": cargo.get("name"),
+            "places_count": cargo.get("places_count"),
+            "net_weight_t": cargo.get("net_weight_t"),
+            "volume_m3": cargo.get("volume_m3"),
+        },
+        "loading": {
+            "infrastructure_owner": {
+                "name": loading.get("loader"),
+                "legal_form": "ООО" if loading.get("loader", "").startswith("ООО") else "",
+                "inn": loading.get("loader_inn"),
+            } if loading.get("loader") else None,
+        },
+    }
+
+
+def _ru_date_to_iso(s: str) -> Optional[str]:
+    if not s:
+        return None
+    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", s)
+    return f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else s
 
 
 def _party(tn: dict, role: str) -> Optional[dict]:
