@@ -19,12 +19,47 @@ from .fields import extract_all
 from .layout import extract_best_text
 from .models import GARBAGE, MISSING, FieldConfidence, ParsedRow
 from .normalize import normalize_for_sections
+from .org_lookup import lookup_by_inn
 from .sections import split_sections
 from .splitter import split_documents
+from .validators import is_valid_inn
 
 
 LOW_TEXT_THRESHOLD = 200  # символов
-CACHE_VERSION = 8  # ↑ при изменении логики парсинга
+CACHE_VERSION = 10  # ↑ при изменении логики парсинга
+
+
+def _enrich_with_inn(raw: str, full_text: str) -> str:
+    """Консервативное обогащение: если в `raw` ИНН отсутствует, но в
+    `full_text` найден валидный ИНН организации с именем, кусок
+    которого присутствует в `raw` — добавляем «, ИНН XXX» в конец.
+
+    НЕ переписываем уже найденное имя (OCR мог распознать «Бекам», а
+    в справочнике «Беком» — нам не надо спорить с экспертом на лету).
+    """
+    if not raw or raw in (MISSING, GARBAGE) or not full_text:
+        return raw
+    import re
+    # Если ИНН уже есть в строке (валидный или нет) — не трогаем,
+    # чтобы не дублировать.
+    if re.search(r"\bИНН\s*\d{10,12}", raw, re.IGNORECASE):
+        return raw
+    if re.search(r"\b(\d{10}|\d{12})\b", raw):
+        return raw
+    raw_low = raw.lower()
+    for m in re.finditer(r"\b(\d{10}|\d{12})\b", full_text):
+        inn = m.group(1)
+        if not is_valid_inn(inn):
+            continue
+        rec = lookup_by_inn(inn)
+        if not rec:
+            continue
+        name = (rec.get("name") or "").lower()
+        # Достаточно 4 первых букв имени в raw, чтобы поверить, что
+        # этот ИНН относится к этой же организации.
+        if name and len(name) >= 4 and name[:4] in raw_low:
+            return f"{raw.rstrip(' ,;')}, ИНН {inn}"
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -91,9 +126,24 @@ def extract_raw_text(pdf_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_row(text: str, source: str) -> ParsedRow:
+def _build_row(text: str, source: str, global_fallback: str = "") -> ParsedRow:
     sections = split_sections(text)
     fields = extract_all(sections, text)
+
+    # Для сводных PDF (несколько ТН в одном файле) одна TN иногда
+    # располагается на двух страницах, и секция «Груз» попадает в
+    # соседний splitter-документ. Если cargo/volume не нашлись в
+    # своём doc, делаем последнюю попытку в полном тексте PDF.
+    if global_fallback and global_fallback != text:
+        from .fields import extract_cargo, extract_volume  # локальный импорт
+        if fields["cargo"][0] in (MISSING, GARBAGE):
+            val, _ = extract_cargo("", global_fallback)
+            if val not in (MISSING, GARBAGE):
+                fields["cargo"] = (val, 0.3)
+        if fields["volume"][0] in (MISSING, GARBAGE):
+            val, _ = extract_volume("", global_fallback)
+            if val not in (MISSING, GARBAGE):
+                fields["volume"] = (val, 0.3)
 
     row = ParsedRow(source=source)
     row.number = fields["number"][0]
@@ -129,7 +179,39 @@ def _build_row(text: str, source: str) -> ParsedRow:
     if row.confidence.overall() < 0.4:
         notes.append("LOW_CONF")
     row.note = ";".join(notes)
+
+    # LLM-fallback при низкой уверенности. No-op без ANTHROPIC_API_KEY
+    # и без пакета `anthropic` — парсер работает как раньше.
+    if row.confidence.overall() < 0.4:
+        try:
+            from .llm_fallback import improve_row
+            row, _ = improve_row(row, global_fallback or text)
+        except Exception:  # pragma: no cover — никогда не ломаем pipeline
+            pass
+
     return row
+
+
+def _is_noise_row(row: ParsedRow) -> bool:
+    """Мусорный row: ни одного «опорного» поля не заполнено.
+
+    Применяется только к multi-doc случаю, чтобы не создавать пустые
+    строки из UPD / REGISTRY / BLANK страниц сводных PDF. Для
+    одиночных ТН (len(documents) == 1) фильтр не активируется — row
+    с пустыми полями всё равно выводится (чтобы пользователь видел,
+    что документ был обработан).
+
+    Опорные поля: number, date, vehicle, driver, shipper — если хотя
+    бы одно не MISSING, row считается осмысленным.
+    """
+    signals = (
+        (row.number not in (MISSING, GARBAGE, ""))
+        + (row.date not in (MISSING, GARBAGE, ""))
+        + (row.vehicle not in (MISSING, GARBAGE, ""))
+        + (row.driver not in (MISSING, GARBAGE, ""))
+        + (row.shipper not in (MISSING, GARBAGE, ""))
+    )
+    return signals == 0
 
 
 def parse_text(text: str, source: str) -> List[ParsedRow]:
@@ -138,10 +220,21 @@ def parse_text(text: str, source: str) -> List[ParsedRow]:
         return [ParsedRow.empty_missing(source, note="LOW_TEXT")]
 
     documents = split_documents(text)
+    # Для сводных PDF (несколько ТН) передаём полный текст как fallback
+    # для cargo/volume — иначе груз, попавший в чужой doc, теряется.
+    global_fallback = text if len(documents) > 1 else ""
     rows: List[ParsedRow] = []
     for i, doc in enumerate(documents):
         row_source = source if len(documents) == 1 else f"{source}#{i + 1}"
-        rows.append(_build_row(doc, row_source))
+        row = _build_row(doc, row_source, global_fallback)
+        # Фильтр мусора для сводных PDF: UPD / REGISTRY / BLANK страницы
+        # часто создают пустые row'ы с конф 0. Не загрязняем Excel.
+        if len(documents) > 1 and _is_noise_row(row):
+            continue
+        rows.append(row)
+    # Если все отфильтрованы — вернём хотя бы первый (fallback-страховка).
+    if not rows and documents:
+        rows.append(_build_row(documents[0], source, global_fallback))
     return rows
 
 

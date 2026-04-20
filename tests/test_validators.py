@@ -10,11 +10,17 @@ from tn_parser.validators import (
 
 class TestDate:
     def test_valid(self):
-        assert is_valid_date("15.03.2024")
-        assert is_valid_date("01.01.2000")
-        assert is_valid_date("29.02.2024")  # leap year
+        # Для ТН валидным считаем только «живой» диапазон: последние
+        # 10 лет + ближайший год. Архивы и далёкое будущее — OCR-шум.
+        import datetime as _dt
+        cur = _dt.date.today().year
+        assert is_valid_date(f"15.03.{cur}")
+        assert is_valid_date(f"15.03.{cur - 9}")
+        assert is_valid_date("29.02.2024")  # leap year внутри диапазона
 
     def test_invalid(self):
+        import datetime as _dt
+        cur = _dt.date.today().year
         assert not is_valid_date("")
         assert not is_valid_date("32.01.2024")
         assert not is_valid_date("15.13.2024")
@@ -22,6 +28,10 @@ class TestDate:
         assert not is_valid_date("15.03.1800")
         assert not is_valid_date("15/03/2024")
         assert not is_valid_date("abc")
+        # Вне «живого» диапазона ТН:
+        assert not is_valid_date("01.01.2000")
+        assert not is_valid_date(f"01.01.{cur - 20}")
+        assert not is_valid_date(f"01.01.{cur + 5}")
 
 
 class TestGRZ:

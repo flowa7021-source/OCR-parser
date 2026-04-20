@@ -20,6 +20,8 @@ from typing import List
 
 import fitz  # PyMuPDF
 
+from .layout_blocks import render_page as _render_layout_page
+
 
 def _page_text_plain(page) -> str:
     return page.get_text("text") or ""
@@ -34,26 +36,49 @@ def _page_text_blocks(page) -> str:
     return "\n\n".join(b[4].strip() for b in text_blocks)
 
 
-def _score_text(text: str) -> int:
-    """Грубая мера «полезности» текста: количество букв+цифр.
+def _page_text_layout(page) -> str:
+    """Layout-aware рендер: двуколоночные страницы получают разделитель
+    между левой и правой колонкой, что упрощает парсеру разделение
+    «Грузоотправитель» / «Заказчик услуг» в двух колонках формы."""
+    try:
+        return _render_layout_page(page) or ""
+    except Exception:  # pragma: no cover
+        return ""
 
-    Нужна, чтобы выбрать из двух стратегий ту, что извлекла больше
-    содержательных символов (а не только пробелов и пунктуации).
-    """
+
+def _score_text(text: str) -> int:
+    """Грубая мера «полезности» текста: количество букв+цифр."""
     return sum(1 for c in text if c.isalnum())
 
 
 def extract_best_text(pdf_path: str) -> str:
-    """Главная функция: выбирает лучшую стратегию страница за страницей."""
+    """Выбирает лучшую стратегию для каждой страницы.
+
+    Приоритет: plain > blocks > layout-aware. Layout-aware подключаем
+    ТОЛЬКО если он существенно богаче содержимым — иначе он ломает
+    хорошо упорядоченные страницы (OCR-Tesseract уже сам строит
+    линейный flow, разбиение по колонкам его рвёт).
+
+    Порог: layout должен быть минимум на 30% богаче лучшего из
+    plain/blocks, чтобы его выбрать.
+    """
     doc = fitz.open(pdf_path)
     try:
         pages: List[str] = []
         for page in doc:
             plain = _page_text_plain(page)
             blocks = _page_text_blocks(page)
-            # Предпочитаем plain, но переключаемся на blocks, если он ощутимо
-            # богаче (разница > 20%).
-            if _score_text(blocks) > _score_text(plain) * 1.2:
+            best_score = max(_score_text(plain), _score_text(blocks))
+
+            # Layout-aware рассматриваем только если базовые стратегии
+            # дали мало: OCR плохо справился с линейным порядком.
+            # Иначе предпочитаем blocks (при разнице ≥20%) или plain.
+            layout = _page_text_layout(page) if best_score < 100 else ""
+            layout_score = _score_text(layout)
+
+            if layout_score >= best_score * 1.3 and layout_score > 50:
+                pages.append(layout)
+            elif _score_text(blocks) > _score_text(plain) * 1.2:
                 pages.append(blocks)
             else:
                 pages.append(plain)

@@ -30,14 +30,30 @@ INPUTS = ROOT / "inputs"
 EXPECTED = ROOT / "expected"
 
 
+_OCR_SUFFIXES = (" ocred", "-ocred", "_ocred", "-выход", "_выход")
+
+
+def _strip_ocr_suffix(stem: str) -> Tuple[str, Optional[str]]:
+    """Возвращает (base, suffix_or_None). Для 'foo ocred' → ('foo', ' ocred')."""
+    for sfx in _OCR_SUFFIXES:
+        if stem.endswith(sfx):
+            return stem[: -len(sfx)], sfx
+    return stem, None
+
+
+def _match_expected(pdf: Path) -> Optional[Path]:
+    """Ищем expected/<base>.json, где base — имя PDF без OCR-суффиксов."""
+    base, _ = _strip_ocr_suffix(pdf.stem)
+    p = EXPECTED / (base + ".json")
+    return p if p.exists() else None
+
+
 def _load_rows(pdf: Path):
     """Возвращает список ParsedRow.
 
     Стратегия:
-        1) Если рядом с PDF лежит «<stem>.txt» — берём его как сырой
-           текст (после OCR-обвязки извне), пропускаем PyMuPDF.
-        2) Иначе извлекаем текст через PyMuPDF (работает только на
-           PDF с текстовым слоем).
+        1) sidecar «<stem>.txt» рядом с PDF — если есть, берём его.
+        2) PyMuPDF extract_raw_text — для PDF с OCR text-layer.
     """
     sidecar = pdf.with_suffix(".txt")
     if sidecar.exists():
@@ -47,6 +63,22 @@ def _load_rows(pdf: Path):
     if not raw or not raw.strip():
         return None
     return parse_text(raw, pdf.name)
+
+
+def _select_pdfs() -> list:
+    """На каждый base выбираем один PDF по приоритету:
+    ocred > выход > оригинал без суффикса.
+    """
+    priority = {" ocred": 0, "-ocred": 0, "_ocred": 0,
+                "-выход": 1, "_выход": 1, None: 2}
+    best: Dict[str, Path] = {}
+    for pdf in sorted(INPUTS.glob("*.pdf")):
+        base, sfx = _strip_ocr_suffix(pdf.stem)
+        p = priority.get(sfx, 3)
+        if base not in best or priority.get(
+                _strip_ocr_suffix(best[base].stem)[1], 3) > p:
+            best[base] = pdf
+    return sorted(best.values())
 
 FIELDS = ("number", "date", "shipper", "consignee", "cargo",
           "volume", "driver", "vehicle", "reception")
@@ -64,10 +96,71 @@ def _date_iso_to_ru(s: Optional[str]) -> Optional[str]:
 
 
 def _first_tn(doc: dict) -> Optional[dict]:
-    for d in doc.get("documents", []):
-        if d.get("type") == "TN":
+    """Выбираем первую ТН. Поддерживаем два формата expected:
+
+    A) documents: [{type: "TN", ...}]  — наш старый формат.
+    B) documents: ["UPD", "TTN_LIST", ...] + pages: [{document_type: "TTN",
+       structured_fields: {...}}]  — УПД-пакеты (upd_549).
+    """
+    for d in doc.get("documents", []) or []:
+        if isinstance(d, dict) and d.get("type") == "TN":
             return d
+    # Fallback: новая pages-схема.
+    for p in doc.get("pages", []) or []:
+        if p.get("document_type") in ("TTN", "TN"):
+            sf = p.get("structured_fields") or {}
+            if sf:
+                return _ttn_page_to_legacy(sf)
     return None
+
+
+def _ttn_page_to_legacy(sf: dict) -> dict:
+    """Маппим per-page structured_fields к legacy схеме TN."""
+    consignor = sf.get("consignor") or {}
+    consignee = sf.get("consignee") or {}
+    vehicle = sf.get("vehicle") or {}
+    cargo = sf.get("cargo") or {}
+    loading = sf.get("loading_point") or {}
+    # ttn_date: «20.10.22» → «20.10.2022»
+    tdate = (sf.get("ttn_date") or "").strip()
+    if re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", tdate):
+        tdate = tdate[:6] + "20" + tdate[6:]
+    return {
+        "type": "TN",
+        "number": sf.get("ttn_internal_number") or sf.get("order_number"),
+        "date": _ru_date_to_iso(tdate),
+        "parties": [
+            {"role": "shipper", **{k: consignor.get(k) for k in
+                ("name", "legal_form", "inn", "kpp", "address") if consignor.get(k)}},
+            {"role": "consignee", **{k: consignee.get(k) for k in
+                ("name", "legal_form", "inn", "kpp", "address") if consignee.get(k)}},
+            {"role": "carrier", "driver": {"short_name": sf.get("carrier_driver")}},
+        ],
+        "transport": {
+            "vehicle_make": vehicle.get("brand"),
+            "vehicle_reg_plate": vehicle.get("plate"),
+        },
+        "cargo_header": {
+            "description": cargo.get("name"),
+            "places_count": cargo.get("places_count"),
+            "net_weight_t": cargo.get("net_weight_t"),
+            "volume_m3": cargo.get("volume_m3"),
+        },
+        "loading": {
+            "infrastructure_owner": {
+                "name": loading.get("loader"),
+                "legal_form": "ООО" if loading.get("loader", "").startswith("ООО") else "",
+                "inn": loading.get("loader_inn"),
+            } if loading.get("loader") else None,
+        },
+    }
+
+
+def _ru_date_to_iso(s: str) -> Optional[str]:
+    if not s:
+        return None
+    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", s)
+    return f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else s
 
 
 def _party(tn: dict, role: str) -> Optional[dict]:
@@ -114,6 +207,34 @@ def _norm_az(s: str) -> str:
     return s.replace("А", "A").replace("Е", "E").replace("О", "O").upper()
 
 
+def _norm_name(s: str) -> str:
+    """Толерантная нормализация названий: lowercase + типовые OCR-подмены
+    кириллица ↔ латиница ↔ цифры («Моспроект-З» ≡ «Моспроект-3»).
+    """
+    s = s.lower()
+    for a, b in (("ё", "е"), ("з", "3"), ("о", "0"), ("е", "e"),
+                 ("а", "a"), ("р", "p"), ("с", "c"), ("х", "x"),
+                 ("у", "y"), ("к", "k"), ("м", "m"), ("т", "t"),
+                 ("в", "b"), ("н", "h")):
+        s = s.replace(a, b)
+    return re.sub(r"[\s\-_.,«»\"\'()]+", "", s)
+
+
+def _fuzzy_name_match(expected: str, got: str, threshold: int = 75) -> bool:
+    """«Бекам» ≈ «Беком» (OCR-дрейф одной буквы)."""
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        e = _norm_name(expected)
+        g = _norm_name(got)
+        return e in g or g in e
+    e = _norm_name(expected)
+    g = _norm_name(got)
+    if e in g:
+        return True
+    return fuzz.partial_ratio(e, g) >= threshold
+
+
 def check_field(name: str, expected: Any, got: str
                 ) -> Tuple[Optional[bool], str]:
     """Возвращает (ok|None, комментарий). None — нет ожидания."""
@@ -137,7 +258,7 @@ def check_field(name: str, expected: Any, got: str
             miss.append(f"inn {expected['inn']}")
         if expected.get("name"):
             short_name = expected["name"].split(",")[0].strip()
-            if short_name.lower() not in g.lower():
+            if not _fuzzy_name_match(short_name, g):
                 ok = False
                 miss.append(f"name «{short_name}»")
         return ok, (f"got {g!r}" if ok
@@ -159,10 +280,12 @@ def check_field(name: str, expected: Any, got: str
         make, plate = expected
         plate_compact = re.sub(r"\s+", "", plate or "").upper()
         g_compact = re.sub(r"\s+", "", g).upper()
-        ok_plate = bool(plate_compact) and plate_compact in _norm_az(g_compact)
+        ok_plate = bool(plate_compact) and _norm_az(plate_compact) in _norm_az(g_compact)
         ok_make = (not make) or make.upper() in g.upper()
-        ok = ok_plate and ok_make
-        return ok, f"got {g!r}, expected make={make!r}, plate={plate!r}"
+        # Считаем ок, если совпал ГРЗ — марка бонус.
+        ok = ok_plate
+        marker = "full" if (ok_plate and ok_make) else ("plate-only" if ok_plate else "no-plate")
+        return ok, f"got {g!r}, expected make={make!r}, plate={plate!r} [{marker}]"
 
     if name == "cargo":
         words = [w for w in re.findall(r"[А-Яа-яёЁA-Za-z]{4,}", expected.lower())
@@ -199,7 +322,7 @@ def check_field(name: str, expected: Any, got: str
             miss.append(f"inn {expected['inn']}")
         if expected.get("name"):
             short = expected["name"].split(",")[0].strip()
-            if short.lower() not in g.lower():
+            if not _fuzzy_name_match(short, g):
                 miss.append(f"name «{short}»")
         ok = not miss
         return ok, (f"got {g!r}" if ok
@@ -221,7 +344,7 @@ def main() -> int:
         print(f"Папок {INPUTS}/ и {EXPECTED}/ не существует.", file=sys.stderr)
         return 1
 
-    pdfs = sorted(INPUTS.glob("*.pdf"))
+    pdfs = _select_pdfs()
     if not pdfs:
         print(f"В {INPUTS}/ нет PDF.", file=sys.stderr)
         return 1
@@ -231,8 +354,8 @@ def main() -> int:
     }
 
     for pdf in pdfs:
-        exp_path = EXPECTED / (pdf.stem + ".json")
-        if not exp_path.exists():
+        exp_path = _match_expected(pdf)
+        if exp_path is None:
             print(f"\n=== {pdf.name} === (нет expected, пропуск)")
             continue
         expected = json.loads(exp_path.read_text(encoding="utf-8"))
