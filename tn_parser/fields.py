@@ -40,6 +40,18 @@ from .models import MISSING, GARBAGE
 
 _DATE_ANY = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
 
+# Даты, фигурирующие на бланках форм ТН / счёта-фактуры (даты
+# Постановлений Правительства РФ, печатаются прямо на бланке).
+# Это не дата ТН, а метаданные формы.
+_FORM_METADATA_DATES = frozenset({
+    "30.11.2021",  # ПП № 2116 — форма ТН (ред. 2022)
+    "21.12.2020",  # ПП № 2200 — правила перевозок
+    "26.12.2011",  # ПП № 1137 — форма счёта-фактуры
+    "02.04.2021",  # изменение в ПП № 1137
+    "02.04.2024",  # ред. ПП № 1117
+    "11.12.2023",  # ред. правил перевозок
+})
+
 # Номер: не захватываем "Экземпляр №" (подпись у графы экземпляра).
 # N[º°]? убран — голая латинская «N» слишком широкий маркер (матчит «RENAULT» и т.п.).
 # Для «No» обязательна граница слова (\b) — иначе ловит «No» внутри OCR-мусора:
@@ -389,6 +401,19 @@ def extract_number_and_date(
                         or "постановлен" in line_ctx or "договор" in line_ctx
                         or "к правилам" in line_ctx):
                     continue
+                # Широкое окно (300 симв. включая предыдущие строки) —
+                # OCR часто переносит «(в ред. Постановления … № 2116)»
+                # на несколько строк, и маркер «постановлен» уезжает
+                # из текущей строки.
+                wide_ctx = region[max(0, m.start() - 300): m.start()].lower()
+                if ("постановлен" in wide_ctx
+                        or "правительств" in wide_ctx and "рф" in wide_ctx
+                        or "в ред." in wide_ctx or "к правилам" in wide_ctx
+                        or "приложени" in wide_ctx and ("1137" in wide_ctx
+                                                        or "2116" in wide_ctx
+                                                        or "2200" in wide_ctx
+                                                        or "534" in wide_ctx)):
+                    continue
                 candidate = m.group(1).strip(" .,:;")
                 if not candidate:
                     continue
@@ -397,6 +422,15 @@ def extract_number_and_date(
                 # Номер накладной всегда содержит цифру. Одинокие буквы
                 # («й», «yaren») — это OCR-мусор после потерянного №.
                 if not re.search(r"\d", candidate):
+                    continue
+                # Известные номера постановлений / приложений, с которыми
+                # печатают бланки ТН. Если парсер ловит один из них, почти
+                # гарантированно это служебный маркер формы, а не номер ТН.
+                # OCR часто уничтожает слово «Постановление»/«Приложение»
+                # целиком, поэтому контекстный blacklist срабатывает не
+                # всегда — этот список спасает.
+                if candidate in ("1137", "2116", "2200", "2311", "272",
+                                 "534", "1117"):
                     continue
                 if is_garbage(candidate):
                     continue
@@ -409,10 +443,15 @@ def extract_number_and_date(
         if anchor:
             tail = source[anchor.end(): anchor.end() + 500]
             number, conf_num = _pick_number(tail, 0.9 if head else 0.6)
-            date_m = _DATE_ANY.search(tail)
-            if date_m and is_valid_date(date_m.group(1)):
-                date = date_m.group(1)
+            for date_m in _DATE_ANY.finditer(tail):
+                cand = date_m.group(1)
+                if not is_valid_date(cand):
+                    continue
+                if cand in _FORM_METADATA_DATES:
+                    continue  # дата с бланка формы, не из содержимого ТН
+                date = cand
                 conf_date = 1.0 if head else 0.7
+                break
             # OCR иногда теряет символ «№» — тогда после «Транспортная
             # накладная» идёт <дата>\n<номер>. Ловим номер как первую
             # осмысленную строку после заголовка, которая не похожа на
@@ -447,8 +486,9 @@ def extract_number_and_date(
         conf_num = c if number != MISSING else 0.0
     if date == MISSING and full_text:
         for m in _DATE_ANY.finditer(full_text):
-            if is_valid_date(m.group(1)):
-                date = m.group(1)
+            cand = m.group(1)
+            if is_valid_date(cand) and cand not in _FORM_METADATA_DATES:
+                date = cand
                 conf_date = 0.5
                 break
 

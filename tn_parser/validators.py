@@ -14,11 +14,20 @@ _DATE_RE = re.compile(r"\b(\d{2})\.(\d{2})\.(\d{4})\b")
 
 
 def is_valid_date(s: str) -> bool:
+    """Проверка: дата валидна И попадает в правдоподобный диапазон для ТН.
+
+    ТН — действующие документы, не архивные: принимаем даты за последние
+    ~10 лет и на ближайший год вперёд. Даты типа «30.11.2021» (дата
+    Постановления Правительства РФ № 2116, часто печатается на бланке
+    формы) этот чек не отличит от реальных, но совсем дикие («1999» или
+    «2099») отсечёт.
+    """
     m = _DATE_RE.fullmatch(s.strip()) if s else None
     if not m:
         return False
     dd, mm, yyyy = map(int, m.groups())
-    if not (1990 <= yyyy <= 2100):
+    current_year = _dt.date.today().year
+    if not (current_year - 10 <= yyyy <= current_year + 1):
         return False
     try:
         _dt.date(yyyy, mm, dd)
