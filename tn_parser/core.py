@@ -192,6 +192,28 @@ def _build_row(text: str, source: str, global_fallback: str = "") -> ParsedRow:
     return row
 
 
+def _is_noise_row(row: ParsedRow) -> bool:
+    """Мусорный row: ни одного «опорного» поля не заполнено.
+
+    Применяется только к multi-doc случаю, чтобы не создавать пустые
+    строки из UPD / REGISTRY / BLANK страниц сводных PDF. Для
+    одиночных ТН (len(documents) == 1) фильтр не активируется — row
+    с пустыми полями всё равно выводится (чтобы пользователь видел,
+    что документ был обработан).
+
+    Опорные поля: number, date, vehicle, driver, shipper — если хотя
+    бы одно не MISSING, row считается осмысленным.
+    """
+    signals = (
+        (row.number not in (MISSING, GARBAGE, ""))
+        + (row.date not in (MISSING, GARBAGE, ""))
+        + (row.vehicle not in (MISSING, GARBAGE, ""))
+        + (row.driver not in (MISSING, GARBAGE, ""))
+        + (row.shipper not in (MISSING, GARBAGE, ""))
+    )
+    return signals == 0
+
+
 def parse_text(text: str, source: str) -> List[ParsedRow]:
     """Парсит нормализованный текст, возвращая одну или несколько строк."""
     if not text or not text.strip():
@@ -204,7 +226,15 @@ def parse_text(text: str, source: str) -> List[ParsedRow]:
     rows: List[ParsedRow] = []
     for i, doc in enumerate(documents):
         row_source = source if len(documents) == 1 else f"{source}#{i + 1}"
-        rows.append(_build_row(doc, row_source, global_fallback))
+        row = _build_row(doc, row_source, global_fallback)
+        # Фильтр мусора для сводных PDF: UPD / REGISTRY / BLANK страницы
+        # часто создают пустые row'ы с конф 0. Не загрязняем Excel.
+        if len(documents) > 1 and _is_noise_row(row):
+            continue
+        rows.append(row)
+    # Если все отфильтрованы — вернём хотя бы первый (fallback-страховка).
+    if not rows and documents:
+        rows.append(_build_row(documents[0], source, global_fallback))
     return rows
 
 
