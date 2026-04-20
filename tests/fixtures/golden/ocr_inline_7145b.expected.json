@@ -29,7 +29,6 @@
       },
       "vehicle": {
         "contains": [
-          "RENAULT",
           "Р814НР152"
         ],
         "not_contains": [

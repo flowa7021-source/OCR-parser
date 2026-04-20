@@ -115,10 +115,9 @@ class TestOcr2908_23A:
         # — «1.» вместо «2.») всё равно опознаётся как consignee.
         assert "Моспроект" in self.row.consignee
 
-    def test_vehicle_marka_and_compact_grz(self):
-        assert "Scania" in self.row.vehicle
-        assert "С201ВХ152" in self.row.vehicle
-        assert "\n" in self.row.vehicle
+    def test_vehicle_is_compact_grz_only(self):
+        # Vehicle = только ГРЗ, без марки.
+        assert self.row.vehicle == "С201ВХ152"
 
     def test_reception_has_org_and_inn(self):
         assert "ГЕКСАФОРМ" in self.row.reception

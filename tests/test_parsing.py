@@ -19,6 +19,7 @@
   ИНН включительно.
 """
 
+import re
 from pathlib import Path
 
 from tn_parser import MISSING, parse_text
@@ -115,13 +116,9 @@ class TestRealSample7145B:
         assert "Самовывоз" not in self.row.driver
         assert "Рябов" in self.row.driver
 
-    def test_vehicle_has_grz_compact_with_newline(self):
-        # Формат: «RENAULT\nР814НР152».
-        assert "RENAULT" in self.row.vehicle
-        assert "Р814НР152" in self.row.vehicle
-        assert "Р 814 НР 152" not in self.row.vehicle
-        # Марка и ГРЗ на разных строках в одной ячейке.
-        assert "\n" in self.row.vehicle
+    def test_vehicle_is_grz_only_compact(self):
+        # Vehicle = ТОЛЬКО ГРЗ слитно, без марки.
+        assert self.row.vehicle == "Р814НР152"
 
     def test_cargo_keeps_latin_in_mixed_word(self):
         # «Тенsar» — латинская «a» должна остаться латинской.
@@ -186,10 +183,8 @@ class TestOcrTabularLayout:
         assert "Рябов" in self.row.driver
         assert "(реквизиты" not in self.row.driver
 
-    def test_vehicle_marka_newline_grz(self):
-        assert "RENAULT" in self.row.vehicle
-        assert "Р814НР152" in self.row.vehicle
-        assert "\n" in self.row.vehicle
+    def test_vehicle_is_grz_only(self):
+        assert self.row.vehicle == "Р814НР152"
 
     def test_reception_first_line_to_inn(self):
         r = self.row.reception
@@ -269,8 +264,10 @@ class TestOcrNoise:
     def test_vehicle_grz_not_inn_false_positive(self):
         assert "7743553262" not in self.row.vehicle
 
-    def test_vehicle_has_brand(self):
-        assert "RENAULT" in self.row.vehicle
+    def test_vehicle_has_grz(self):
+        # Vehicle = только ГРЗ (без марки).
+        assert "RENAULT" not in self.row.vehicle
+        assert re.search(r"[А-ЯЁ]\d{3}[А-ЯЁ]{2}\d{2,3}", self.row.vehicle)
 
     def test_shipper_no_zakazchik_prefix_has_inn_no_kpp(self):
         s = self.row.shipper
@@ -313,9 +310,8 @@ class TestOcrInlineLayout:
     def test_date_extracted(self):
         assert self.row.date == "23.07.2022"
 
-    def test_vehicle_brand_and_grz_compact(self):
-        assert "RENAULT" in self.row.vehicle
-        assert "Р814НР152" in self.row.vehicle
+    def test_vehicle_grz_compact_no_brand(self):
+        assert self.row.vehicle == "Р814НР152"
 
     def test_shipper_ok_no_kpp(self):
         assert "Бекам" in self.row.shipper

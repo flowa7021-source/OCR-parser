@@ -26,7 +26,7 @@ from .validators import is_valid_inn
 
 
 LOW_TEXT_THRESHOLD = 200  # символов
-CACHE_VERSION = 9  # ↑ при изменении логики парсинга
+CACHE_VERSION = 10  # ↑ при изменении логики парсинга
 
 
 def _enrich_with_inn(raw: str, full_text: str) -> str:

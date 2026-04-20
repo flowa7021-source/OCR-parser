@@ -102,9 +102,9 @@ class TestGraphConfusion:
         assert "Баумана" in r
         assert "Переадресовка" not in r
 
-    def test_vehicle_extracted(self):
+    def test_vehicle_grz_only(self):
         v = self.row.vehicle
-        assert "VOLVO" in v
+        assert "VOLVO" not in v
         assert "В404КМ716" in v
         assert "Приём" not in v
         assert "Баумана" not in v

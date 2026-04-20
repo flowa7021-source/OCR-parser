@@ -782,21 +782,17 @@ def _vehicle_marka_candidates(section_body: str, grz: Optional[str]) -> List[str
 
 
 def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
-    """Транспортное средство: «МАРКА\\nГРЗ_слитно» (перенос строки внутри ячейки).
+    """Транспортное средство: ТОЛЬКО ГРЗ (госномер) слитно без пробелов.
 
-    ГРЗ выдаётся без пробелов (С782СК62, не С 782 СК 62).
+    Пример: «С782СК62», «Р814НР152». Марка автомобиля НЕ извлекается —
+    пользователю нужен только идентификатор ТС (ГРЗ), по которому его
+    можно однозначно найти.
     """
     if section_body:
         grz = _compact_grz_search(section_body)
-        marka_parts = _vehicle_marka_candidates(section_body, grz)
-
         if grz:
-            grz_compact = grz.replace(" ", "")
-            if marka_parts:
-                marka = marka_parts[0].strip(" ,;")
-                return f"{marka}\n{grz_compact}", 1.0
-            return grz_compact, 1.0
-
+            return grz.replace(" ", ""), 1.0
+        # ГРЗ не нашли — первая содержательная строка как запас.
         lines = _meaningful_lines(section_body)
         if lines:
             return lines[0][:80], 0.5
