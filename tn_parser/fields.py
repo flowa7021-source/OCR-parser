@@ -184,9 +184,10 @@ _FIO_RE = re.compile(
 _FIO_FULL_RE = re.compile(
     r"\b[A-Za-zА-ЯЁа-яё]{3,14}[ \t]+[А-ЯЁ][а-яё]{2,14}[ \t]+[А-ЯЁ][а-яё]{2,14}\b"
 )
-# OCR регулярно искажает «шт»: «нтт», «иіт», «шт.», «штт» и пр.
-# Допускаем 2–3 буквы из множества {ш, н, и, т, i, ї}, последняя — обязательно «т».
-_SHT_OCR = r"(?:шт|штт|нтт?|нт|ит|иіт|иiт|штi|штi\.?)"
+# OCR регулярно искажает «шт»: «нтт», «штт», «шт.». Допускаем
+# 2–3 буквы, последняя — обязательно «т». НЕ включаем «ит» (слишком
+# часто ловит «Итого», «5 из 10» и подобные артефакты).
+_SHT_OCR = r"(?:шт|штт|нтт|нт)"
 _CARGO_QTY_SHT_RE = re.compile(
     rf",?\s*\d+(?:[,.]\d+)?\s*{_SHT_OCR}\.?\s*$", re.IGNORECASE
 )
@@ -816,10 +817,6 @@ def extract_vehicle(section_body: str, full_text: str) -> Tuple[str, float]:
         grz = _compact_grz_search(section_body)
         if grz:
             return grz.replace(" ", ""), 1.0
-        # ГРЗ не нашли — первая содержательная строка как запас.
-        lines = _meaningful_lines(section_body)
-        if lines:
-            return lines[0][:80], 0.5
 
     if full_text:
         grz = _compact_grz_search(full_text)
