@@ -78,6 +78,18 @@ class TestFuzzyTitles:
                   "Гпузополучатель", "Грузопопучатель"):
             assert self._classify(s) == "consignee", s
 
+    def test_shipper_synonyms_from_invoice(self):
+        # В счёте-фактуре / УПД роль «грузоотправитель» называется
+        # «Продавец» или «Поставщик». OCR-варианты допустимы.
+        for s in ("Продавец", "Поставщик", "Продавец:", "Прадавец",
+                  "Поставщнк"):
+            assert self._classify(s) == "shipper", s
+
+    def test_consignee_synonyms_from_invoice(self):
+        # «Покупатель» → consignee.
+        for s in ("Покупатель", "Покупатель:", "Пакупатель", "Покупател"):
+            assert self._classify(s) == "consignee", s
+
     def test_carrier_ocr_variants(self):
         for s in ("Перевозчик", "Перевозчип", "Перевазчик", "Пёревозчик"):
             assert self._classify(s) == "carrier", s
