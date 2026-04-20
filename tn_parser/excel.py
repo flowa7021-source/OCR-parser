@@ -126,11 +126,23 @@ def write_excel_safe(rows: List[ParsedRow], output_path: str) -> str:
 
     Возвращает фактический путь, куда удалось записать. Бросает оригинальное
     исключение, если и запасной вариант не сработал.
+
+    Также пишет снапшот исходного вывода парсера в `<output>.snapshot.json`
+    для последующей сверки с правками оператора (feedback-loop, см.
+    `tools/collect_feedback.py`).
     """
     try:
         write_excel(rows, output_path)
-        return output_path
+        actual = output_path
     except PermissionError:
         alt = _timestamped(output_path)
         write_excel(rows, alt)
-        return alt
+        actual = alt
+    # Снапшот — рядом с Excel. Ошибки записи снапшота не фатальны.
+    try:
+        from pathlib import Path
+        from .feedback import save_snapshot
+        save_snapshot(rows, Path(actual + ".snapshot.json"))
+    except Exception:  # noqa: BLE001
+        pass
+    return actual
